@@ -1,0 +1,67 @@
+<comment>
+problem   = Idealized galaxy precipitator (Athena++) 
+configure = --prob=precipitator --coord=spherical_polar -b
+
+<job>
+problem_id = precipitator
+
+<output1>
+file_type  = hst
+dcycle	   = 1
+
+<output2>
+file_type  = vtk
+variable   = prim
+dcycle	   = 1
+id         = prim
+
+<output3>
+file_type   = rst
+ghost_zones = true
+id          = restart
+dt          = 1000.0
+
+<time>
+cfl_number = 0.2
+nlim       = 1000
+tlim       = 1.0e4
+integrator = rk2
+ncycle_out = 1
+
+<mesh>
+nx1    = 32
+x1min  = 1.0
+x1max  = 100.0
+ix1_bc = reflecting
+ox1_bc = reflecting
+
+nx2    = 32
+x2min  = 0.0
+x2max  = 3.141592653589793
+ix2_bc = polar
+ox2_bc = polar
+
+nx3    = 32
+x3min  = 0.0
+x3max  = 6.2831853071795862
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 32
+nx2 = 32
+nx3 = 32
+
+<hydro>
+gamma = 1.6666666666666667
+
+<units>
+unit_system = custom
+mass_cgs    = 1.98841586e+33
+length_cgs  = 3.086e21
+time_cgs    = 3.15576e+13
+
+<precipitator>
+hse_profile_filename = inputs/hse_3.0.txt
+uniform_init = 0
+force_free_param_file = inputs/force_free_params.txt
