@@ -1041,7 +1041,7 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
 
   g_force_free_param_file =
       pin->GetOrAddString("precipitator", "force_free_param_file",
-                          "inputs/aphi.txt");
+                          "inputs/force_free_params.txt");
 #if defined(COORDINATE_SYSTEM)
   if (std::strcmp(COORDINATE_SYSTEM, "spherical_polar") != 0) {
     std::stringstream msg;
@@ -1585,7 +1585,14 @@ void PrecipitatorGravity(MeshBlock *pmb, const Real time, const Real dt,
         const Real inv_rho = 1.0 / std::max(rho, TINY_NUMBER);
         const Real KE = 0.5 * (SQR(mom1) + SQR(mom2) + SQR(mom3)) * inv_rho;
         const Real Eint_total = Etot - KE;
-        const Real pressure = Eint_total * g_gm1;
+        Real thermal_eint = Eint_total;
+#if MAGNETIC_FIELDS_ENABLED
+        const Real b1 = bcc(IB1, k, j, i);
+        const Real b2 = bcc(IB2, k, j, i);
+        const Real b3 = bcc(IB3, k, j, i);
+        thermal_eint -= 0.5 * (SQR(b1) + SQR(b2) + SQR(b3));
+#endif
+        const Real pressure = thermal_eint * g_gm1;
 
         if (gravity_enabled && pressure > 0.0) {
           const Real dx1 = pcoord->dx1v(i);
@@ -1612,14 +1619,7 @@ void PrecipitatorGravity(MeshBlock *pmb, const Real time, const Real dt,
           const Real cooling_taper = MagicHeatingTaper(radius_code);
           if (cooling_taper > 0.0) {
             // Use the same altitude taper as magic heating.
-            Real available_eint = Eint_total;
-#if MAGNETIC_FIELDS_ENABLED
-            const Real b1 = bcc(IB1, k, j, i);
-            const Real b2 = bcc(IB2, k, j, i);
-            const Real b3 = bcc(IB3, k, j, i);
-            available_eint -= 0.5 * (SQR(b1) + SQR(b2) + SQR(b3));
-#endif
-            const Real thermal_energy = std::max(available_eint, 0.0);
+            const Real thermal_energy = std::max(thermal_eint, 0.0);
             if (thermal_energy > 0.0) {
               const Real cooling_strength =
                   cooling_taper * g_powerlaw_lambda_code * rho * rho;
