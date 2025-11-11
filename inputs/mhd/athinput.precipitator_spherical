@@ -11,19 +11,19 @@ dcycle	   = 1
 
 <output2>
 file_type  = vtk
-variable   = prim,divB,tcool_myr
-dcycle	   = 100
+variable   = prim,divB,tcool_myr,delta_rho_over_rho_bar
+dcycle	   = 1000
 id         = prim
 
 <output3>
 file_type   = rst
 ghost_zones = true
 id          = restart
-dt          = 200.0
+dcycle	    = 10000
 
 <time>
 cfl_number = 0.2
-nlim       = 20000
+nlim       = 500000
 tlim       = 1.0e3
 integrator = rk2
 xorder 	   = 2c
@@ -73,8 +73,8 @@ powerlaw_lambda_cgs = 1e-22
 
 enable_fourier_bessel_perturbations = 1
 perturbation_sigma = 0.01
-perturbation_lmax = 24
-perturbation_radial_modes = 32
+perturbation_lmax = 12
+perturbation_radial_modes = 16
 perturbation_kmin = 1.0
 perturbation_kmax = 32.0
 perturbation_small_kr_threshold = 1.0

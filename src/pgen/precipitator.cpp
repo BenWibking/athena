@@ -163,6 +163,106 @@ std::vector<Real> g_pert_coeff_sin;
 std::vector<Real> g_pert_k_values;
 std::vector<Real> g_pert_radial_weight;
 
+constexpr const char *kDensityContrastName = "delta_rho_over_rho_bar";
+std::vector<Real> g_radial_density_profile;
+Real g_radial_density_time = std::numeric_limits<Real>::quiet_NaN();
+int g_radial_density_cycle = -1;
+bool g_radial_density_ready = false;
+
+std::int64_t ComputeGlobalX1Offset(const MeshBlock &pmb, int nx1_total) {
+  const std::int64_t cell_count = static_cast<std::int64_t>(pmb.block_size.nx1);
+  const std::int64_t base_index = static_cast<std::int64_t>(pmb.loc.lx1) * cell_count;
+  const std::int64_t end_index = base_index + cell_count;
+  if (base_index < 0 || end_index > static_cast<std::int64_t>(nx1_total)) {
+    std::stringstream msg;
+    msg << "### FATAL ERROR in precipitator.cpp" << std::endl
+        << "Invalid radial index mapping for density contrast output.";
+    ATHENA_ERROR(msg);
+  }
+  return base_index;
+}
+
+void ComputeRadiallyAveragedDensity(Mesh *mesh) {
+  if (mesh == nullptr) {
+    return;
+  }
+  if (mesh->multilevel) {
+    std::stringstream msg;
+    msg << "### FATAL ERROR in precipitator.cpp" << std::endl
+        << "Density contrast output is not implemented for multilevel meshes.";
+    ATHENA_ERROR(msg);
+  }
+
+  const int nx1_total = mesh->mesh_size.nx1;
+  if (nx1_total <= 0) {
+    g_radial_density_profile.clear();
+    g_radial_density_ready = false;
+    return;
+  }
+
+  std::vector<Real> rho_sum(static_cast<std::size_t>(nx1_total), 0.0);
+  std::vector<Real> volume(static_cast<std::size_t>(nx1_total), 0.0);
+
+  for (int block = 0; block < mesh->nblocal; ++block) {
+    MeshBlock *pmb = mesh->my_blocks(block);
+    if (pmb == nullptr || pmb->phydro == nullptr) {
+      continue;
+    }
+    Coordinates *coord = pmb->pcoord;
+    auto &prim = pmb->phydro->w;
+    const int i_offset = pmb->is;
+    const std::int64_t base_index = ComputeGlobalX1Offset(*pmb, nx1_total);
+
+    for (int i = pmb->is; i <= pmb->ie; ++i) {
+      const std::int64_t global_i = base_index + static_cast<std::int64_t>(i - i_offset);
+      const std::size_t idx = static_cast<std::size_t>(global_i);
+      for (int k = pmb->ks; k <= pmb->ke; ++k) {
+        for (int j = pmb->js; j <= pmb->je; ++j) {
+          const Real cell_volume = coord->GetCellVolume(k, j, i);
+          const Real rho = prim(IDN, k, j, i);
+          rho_sum[idx] += rho * cell_volume;
+          volume[idx] += cell_volume;
+        }
+      }
+    }
+  }
+
+#ifdef MPI_PARALLEL
+  MPI_Allreduce(MPI_IN_PLACE, rho_sum.data(), nx1_total, MPI_ATHENA_REAL, MPI_SUM,
+                MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE, volume.data(), nx1_total, MPI_ATHENA_REAL, MPI_SUM,
+                MPI_COMM_WORLD);
+#endif
+
+  g_radial_density_profile.assign(static_cast<std::size_t>(nx1_total), 0.0);
+  for (int i = 0; i < nx1_total; ++i) {
+    const std::size_t idx = static_cast<std::size_t>(i);
+    if (volume[idx] > 0.0) {
+      g_radial_density_profile[idx] = rho_sum[idx] / volume[idx];
+    } else {
+      g_radial_density_profile[idx] = 0.0;
+    }
+  }
+
+  g_radial_density_ready = true;
+  g_radial_density_time = mesh->time;
+  g_radial_density_cycle = mesh->ncycle;
+}
+
+const std::vector<Real> &GetRadiallyAveragedDensity(Mesh *mesh) {
+  static const std::vector<Real> kEmptyProfile;
+  if (mesh == nullptr) {
+    return kEmptyProfile;
+  }
+  const bool size_changed =
+      static_cast<int>(g_radial_density_profile.size()) != mesh->mesh_size.nx1;
+  if (!g_radial_density_ready || size_changed || g_radial_density_cycle != mesh->ncycle
+      || g_radial_density_time != mesh->time) {
+    ComputeRadiallyAveragedDensity(mesh);
+  }
+  return g_radial_density_profile;
+}
+
 constexpr Real kForceFreeSeriesLimit = 1.0e-6;
 constexpr Real kSqrtTwo = 1.41421356237309504880;
 constexpr Real kPerturbationWarningThreshold = 1.0e6;
@@ -1249,6 +1349,8 @@ void MeshBlock::InitUserMeshBlockData(ParameterInput *pin) {
   ++noutputs;  // reserve space for divB diagnostic
 #endif
 
+  ++noutputs;  // density contrast output
+
   if (noutputs == 0) {
     return;
   }
@@ -1261,6 +1363,7 @@ void MeshBlock::InitUserMeshBlockData(ParameterInput *pin) {
 #if MAGNETIC_FIELDS_ENABLED
   SetUserOutputVariableName(idx++, "divB");
 #endif
+  SetUserOutputVariableName(idx++, kDensityContrastName);
 }
 
 //========================================================================================
@@ -1272,6 +1375,7 @@ void MeshBlock::UserWorkBeforeOutput(ParameterInput *pin) {
     return;
   }
 
+  auto &prim = phydro->w;
   int next_index = 0;
   const int tcool_index = g_enable_powerlaw_cooling ? next_index++ : -1;
 #if MAGNETIC_FIELDS_ENABLED
@@ -1279,6 +1383,7 @@ void MeshBlock::UserWorkBeforeOutput(ParameterInput *pin) {
 #else
   constexpr int divb_index = -1;
 #endif
+  const int density_contrast_index = next_index++;
 
   if (tcool_index >= 0) {
     Units *units = pmy_mesh->punit;
@@ -1292,7 +1397,6 @@ void MeshBlock::UserWorkBeforeOutput(ParameterInput *pin) {
     const Real gm1 = g_gm1;
     const Real million_yr_code = units->million_yr_code;
     const Real lambda = g_powerlaw_lambda_code;
-    auto &prim = phydro->w;
 
     for (int k = ks; k <= ke; ++k) {
       for (int j = js; j <= je; ++j) {
@@ -1354,6 +1458,34 @@ void MeshBlock::UserWorkBeforeOutput(ParameterInput *pin) {
     }
   }
 #endif
+
+  if (density_contrast_index >= 0) {
+    Mesh *mesh = pmy_mesh;
+    const std::vector<Real> &rho_bar = GetRadiallyAveragedDensity(mesh);
+    const bool has_profile =
+        (mesh != nullptr) && (mesh->mesh_size.nx1 > 0)
+        && (rho_bar.size() == static_cast<std::size_t>(mesh->mesh_size.nx1));
+    std::int64_t base_index = 0;
+    if (has_profile) {
+      base_index = ComputeGlobalX1Offset(*this, mesh->mesh_size.nx1);
+    }
+
+    for (int k = ks; k <= ke; ++k) {
+      for (int j = js; j <= je; ++j) {
+        for (int i = is; i <= ie; ++i) {
+          Real contrast = 0.0;
+          if (has_profile) {
+            const std::int64_t global_i = base_index + static_cast<std::int64_t>(i - is);
+            const Real rho_avg = rho_bar[static_cast<std::size_t>(global_i)];
+            if (rho_avg > 0.0) {
+              contrast = (prim(IDN, k, j, i) - rho_avg) / rho_avg;
+            }
+          }
+          user_out_var(density_contrast_index, k, j, i) = contrast;
+        }
+      }
+    }
+  }
 }
 
 //========================================================================================
