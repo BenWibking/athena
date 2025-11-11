@@ -1476,21 +1476,28 @@ void PrecipitatorGravity(MeshBlock *pmb, const Real time, const Real dt,
         }
 
         if (cooling_enabled) {
-          Real available_eint = Eint_total;
+          const Real radius_code = pcoord->x1v(i);
+          const Real cooling_taper = MagicHeatingTaper(radius_code);
+          if (cooling_taper > 0.0) {
+            // Use the same altitude taper as magic heating.
+            Real available_eint = Eint_total;
 #if MAGNETIC_FIELDS_ENABLED
-          const Real b1 = bcc(IB1, k, j, i);
-          const Real b2 = bcc(IB2, k, j, i);
-          const Real b3 = bcc(IB3, k, j, i);
-          available_eint -= 0.5 * (SQR(b1) + SQR(b2) + SQR(b3));
+            const Real b1 = bcc(IB1, k, j, i);
+            const Real b2 = bcc(IB2, k, j, i);
+            const Real b3 = bcc(IB3, k, j, i);
+            available_eint -= 0.5 * (SQR(b1) + SQR(b2) + SQR(b3));
 #endif
-          const Real thermal_energy = std::max(available_eint, 0.0);
-          if (thermal_energy > 0.0) {
-            const Real cooling_strength = g_powerlaw_lambda_code * rho * rho;
-            if (cooling_strength > 0.0) {
-              // Exact integration of de/dt = -rho^2 Lambda with constant Lambda
-              const Real eint_new = std::max(thermal_energy - dt * cooling_strength, 0.0);
-              const Real dE = thermal_energy - eint_new;
-              cons(IEN, k, j, i) -= dE;
+            const Real thermal_energy = std::max(available_eint, 0.0);
+            if (thermal_energy > 0.0) {
+              const Real cooling_strength =
+                  cooling_taper * g_powerlaw_lambda_code * rho * rho;
+              if (cooling_strength > 0.0) {
+                // Exact integration of de/dt = -rho^2 Lambda with constant Lambda
+                const Real eint_new =
+                    std::max(thermal_energy - dt * cooling_strength, 0.0);
+                const Real dE = thermal_energy - eint_new;
+                cons(IEN, k, j, i) -= dE;
+              }
             }
           }
         }
@@ -1499,9 +1506,9 @@ void PrecipitatorGravity(MeshBlock *pmb, const Real time, const Real dt,
           const Real z = pcoord->x3v(k);
           const Real err = SampleMagicHeatingError(z);
           if (err != 0.0) {
-            const Real taper = MagicHeatingTaper(z);
+            const Real radius_code = pcoord->x1v(i);
+            const Real taper = MagicHeatingTaper(radius_code);
             if (taper > 0.0) {
-              const Real radius_code = pcoord->x1v(i);
               const Real rho_bg = SampleBackgroundDensityCode(radius_code, units);
               const Real pressure_bg = SampleBackgroundPressureCode(radius_code, units);
               Real inv_t_cool = 0.0;
