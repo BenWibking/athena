@@ -663,10 +663,26 @@ void MeshBlock::ProblemGenerator(ParameterInput *pin) {
 //! \brief Allocate auxiliary cooling-time output when power-law cooling is active
 //========================================================================================
 void MeshBlock::InitUserMeshBlockData(ParameterInput *pin) {
+  int noutputs = 0;
   if (g_enable_powerlaw_cooling) {
-    AllocateUserOutputVariables(1);
-    SetUserOutputVariableName(0, "tcool_myr");
+    ++noutputs;
   }
+#if MAGNETIC_FIELDS_ENABLED
+  ++noutputs;  // reserve space for divB diagnostic
+#endif
+
+  if (noutputs == 0) {
+    return;
+  }
+
+  AllocateUserOutputVariables(noutputs);
+  int idx = 0;
+  if (g_enable_powerlaw_cooling) {
+    SetUserOutputVariableName(idx++, "tcool_myr");
+  }
+#if MAGNETIC_FIELDS_ENABLED
+  SetUserOutputVariableName(idx++, "divB");
+#endif
 }
 
 //========================================================================================
@@ -674,41 +690,92 @@ void MeshBlock::InitUserMeshBlockData(ParameterInput *pin) {
 //! \brief Fill auxiliary cooling-time output in Myr
 //========================================================================================
 void MeshBlock::UserWorkBeforeOutput(ParameterInput *pin) {
-  if (!g_enable_powerlaw_cooling || nuser_out_var == 0) {
+  if (nuser_out_var == 0) {
     return;
   }
 
-  Units *units = pmy_mesh->punit;
-  if (units == nullptr) {
-    std::stringstream msg;
-    msg << "### FATAL ERROR in precipitator.cpp" << std::endl
-        << "Units object is not initialized.";
-    ATHENA_ERROR(msg);
-  }
+  int next_index = 0;
+  const int tcool_index = g_enable_powerlaw_cooling ? next_index++ : -1;
+#if MAGNETIC_FIELDS_ENABLED
+  const int divb_index = next_index++;
+#else
+  constexpr int divb_index = -1;
+#endif
 
-  const Real gm1 = g_gm1;
-  const Real million_yr_code = units->million_yr_code;
-  const Real lambda = g_powerlaw_lambda_code;
-  auto &prim = phydro->w;
+  if (tcool_index >= 0) {
+    Units *units = pmy_mesh->punit;
+    if (units == nullptr) {
+      std::stringstream msg;
+      msg << "### FATAL ERROR in precipitator.cpp" << std::endl
+          << "Units object is not initialized.";
+      ATHENA_ERROR(msg);
+    }
 
-  for (int k = ks; k <= ke; ++k) {
-    for (int j = js; j <= je; ++j) {
-      for (int i = is; i <= ie; ++i) {
-        const Real rho = prim(IDN, k, j, i);
-        const Real pressure = prim(IPR, k, j, i);
-        Real tcool_myr = std::numeric_limits<Real>::infinity();
-        if (rho > 0.0 && pressure > 0.0 && lambda > 0.0 && million_yr_code > 0.0) {
-          const Real eint = pressure / gm1;
-          const Real denom = lambda * rho * rho;
-          if (denom > 0.0) {
-            const Real tcool_code = eint / denom;
-            tcool_myr = tcool_code / million_yr_code;
+    const Real gm1 = g_gm1;
+    const Real million_yr_code = units->million_yr_code;
+    const Real lambda = g_powerlaw_lambda_code;
+    auto &prim = phydro->w;
+
+    for (int k = ks; k <= ke; ++k) {
+      for (int j = js; j <= je; ++j) {
+        for (int i = is; i <= ie; ++i) {
+          const Real rho = prim(IDN, k, j, i);
+          const Real pressure = prim(IPR, k, j, i);
+          Real tcool_myr = std::numeric_limits<Real>::infinity();
+          if (rho > 0.0 && pressure > 0.0 && lambda > 0.0 && million_yr_code > 0.0) {
+            const Real eint = pressure / gm1;
+            const Real denom = lambda * rho * rho;
+            if (denom > 0.0) {
+              const Real tcool_code = eint / denom;
+              tcool_myr = tcool_code / million_yr_code;
+            }
           }
+          user_out_var(tcool_index, k, j, i) = tcool_myr;
         }
-        user_out_var(0, k, j, i) = tcool_myr;
       }
     }
   }
+
+#if MAGNETIC_FIELDS_ENABLED
+  if (divb_index >= 0) {
+    FaceField &bf = pfield->b;
+    Coordinates *coord = pcoord;
+    const int nx1 = ncells1;
+    AthenaArray<Real> face1, face2p, face2m, face3p, face3m, volume;
+    face1.NewAthenaArray(nx1 + 1);
+    face2p.NewAthenaArray(nx1);
+    face2m.NewAthenaArray(nx1);
+    face3p.NewAthenaArray(nx1);
+    face3m.NewAthenaArray(nx1);
+    volume.NewAthenaArray(nx1);
+
+    for (int k = ks; k <= ke; ++k) {
+      for (int j = js; j <= je; ++j) {
+        coord->Face1Area(k, j, is, ie + 1, face1);
+        coord->Face2Area(k, j + 1, is, ie, face2p);
+        coord->Face2Area(k, j, is, ie, face2m);
+        coord->Face3Area(k + 1, j, is, ie, face3p);
+        coord->Face3Area(k, j, is, ie, face3m);
+        coord->CellVolume(k, j, is, ie, volume);
+
+        for (int i = is; i <= ie; ++i) {
+          const Real flux_x1 =
+              face1(i + 1) * bf.x1f(k, j, i + 1) - face1(i) * bf.x1f(k, j, i);
+          const Real flux_x2 =
+              face2p(i) * bf.x2f(k, j + 1, i) - face2m(i) * bf.x2f(k, j, i);
+          const Real flux_x3 =
+              face3p(i) * bf.x3f(k + 1, j, i) - face3m(i) * bf.x3f(k, j, i);
+          const Real cell_vol = volume(i);
+          Real divb = 0.0;
+          if (cell_vol > 0.0) {
+            divb = (flux_x1 + flux_x2 + flux_x3) / cell_vol;
+          }
+          user_out_var(divb_index, k, j, i) = divb;
+        }
+      }
+    }
+  }
+#endif
 }
 
 //========================================================================================

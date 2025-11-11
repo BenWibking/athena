@@ -11,7 +11,7 @@ dcycle	   = 1
 
 <output2>
 file_type  = vtk
-variable   = prim
+variable   = prim,divB,tcool_myr
 dcycle	   = 100
 id         = prim
 
