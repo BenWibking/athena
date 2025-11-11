@@ -13,8 +13,11 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
+#include <exception>
 #include <fstream>
 #include <functional>
+#include <iostream>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -124,7 +127,27 @@ bool g_force_free_loaded = false;
 Real g_force_free_alpha = 0.0;
 Real g_force_free_amplitude = 1.0;
 
+bool g_enable_density_perturbations = false;
+Real g_pert_sigma = 0.0;
+int g_pert_lmax = 0;
+int g_pert_radial_modes = 0;
+Real g_pert_kmin = 0.0;
+Real g_pert_kmax = 0.0;
+Real g_pert_small_kr_threshold = 1.0;
+std::uint64_t g_pert_seed = 88172645463393265ULL;
+std::uint64_t g_pert_state = 0;
+Real g_pert_radius_min = 0.0;
+Real g_pert_radius_max = 1.0;
+bool g_pert_ready = false;
+
+std::vector<Real> g_pert_coeff_cos;
+std::vector<Real> g_pert_coeff_sin;
+std::vector<Real> g_pert_k_values;
+std::vector<Real> g_pert_radial_weight;
+
 constexpr Real kForceFreeSeriesLimit = 1.0e-6;
+constexpr Real kSqrtTwo = 1.41421356237309504880;
+constexpr Real kPerturbationWarningThreshold = 1.0e6;
 
 constexpr std::array<Real, 7> kGaussNodes = {
     {-0.94910791234275852453, -0.74153118559939443986, -0.40584515137739716691,
@@ -435,6 +458,286 @@ void InitializeForceFreeField(MeshBlock *pmb) {
 #endif
 }
 
+int PerturbationCoefficientCount() {
+  return (g_pert_lmax + 1) * (g_pert_lmax + 2) / 2;
+}
+
+bool PerturbationsActive() {
+  return g_enable_density_perturbations && (g_pert_sigma != 0.0) &&
+         (g_pert_radial_modes > 0);
+}
+
+Real ScaleRadius(Real r) {
+  const Real denom = g_pert_radius_max - g_pert_radius_min;
+  if (denom <= 0.0) {
+    return 0.0;
+  }
+  Real scaled = (r - g_pert_radius_min) / denom;
+  if (scaled < 0.0) {
+    scaled = 0.0;
+  } else if (scaled > 1.0) {
+    scaled = 1.0;
+  }
+  return scaled;
+}
+
+Real RandomUniform01() {
+  constexpr double inv = 1.0 / 9007199254740992.0;
+  g_pert_state = g_pert_state * 6364136223846793005ULL + 1ULL;
+  const std::uint64_t mantissa = (g_pert_state >> 11) & 0x1fffffffffffffULL;
+  return static_cast<Real>(static_cast<double>(mantissa) * inv);
+}
+
+Real RandomSymmetric() { return 2.0 * RandomUniform01() - 1.0; }
+
+Real SmallXSphericalBessel(int l, Real x) {
+  if (l == 0) {
+    const Real x2 = x * x;
+    return 1.0 - x2 / 6.0 + x2 * x2 / 120.0;
+  }
+  if (l == 1) {
+    const Real x2 = x * x;
+    return x / 3.0 - x * x2 / 30.0 + x2 * x2 * x / 840.0;
+  }
+  Real result = 1.0;
+  for (int k = 1; k <= l; ++k) {
+    result *= static_cast<Real>(2 * k + 1);
+  }
+  result = std::pow(std::abs(x), static_cast<Real>(l)) / result;
+  if (x < 0.0 && (l % 2) == 1) {
+    result = -result;
+  }
+  return result;
+}
+
+Real NoiseSphericalBessel(int l, Real x) {
+  const Real ax = std::abs(x);
+  if (l == 0) {
+    return SphericalBesselJ0(x);
+  }
+  if (l == 1) {
+    return SphericalBesselJ1(x);
+  }
+  if (ax < g_pert_small_kr_threshold) {
+    return SmallXSphericalBessel(l, x);
+  }
+  Real jm1 = SphericalBesselJ0(x);
+  Real jcurr = SphericalBesselJ1(x);
+  for (int ell = 1; ell < l; ++ell) {
+    if (ax < g_pert_small_kr_threshold) {
+      return SmallXSphericalBessel(l, x);
+    }
+    const Real jp1 = ((2.0 * ell + 1.0) / x) * jcurr - jm1;
+    if (!std::isfinite(jp1) || std::abs(jp1) > 1.0e12) {
+      std::cout << "### Warning in precipitator.cpp: spherical Bessel recurrence overflow "
+                << "(l=" << l << ", ell=" << ell << ", x=" << x
+                << ", jm1=" << jm1 << ", jcurr=" << jcurr << ", jp1=" << jp1
+                << ")\n";
+    }
+    jm1 = jcurr;
+    jcurr = jp1;
+  }
+  return jcurr;
+}
+
+Real AssociatedLegendre(int l, int m, Real x) {
+  if (m < 0 || m > l) {
+    return 0.0;
+  }
+  Real pmm = 1.0;
+  if (m > 0) {
+    Real arg = 1.0 - x * x;
+    if (arg < 0.0) {
+      arg = 0.0;
+    }
+    Real somx2 = std::sqrt(arg);
+    Real fact = 1.0;
+    for (int i = 1; i <= m; ++i) {
+      pmm *= -fact * somx2;
+      fact += 2.0;
+    }
+  }
+  if (l == m) {
+    return pmm;
+  }
+  Real pmmp1 = x * (2 * m + 1) * pmm;
+  if (l == m + 1) {
+    return pmmp1;
+  }
+  Real pll = 0.0;
+  for (int i = m + 2; i <= l; ++i) {
+    pll = ((2 * i - 1) * x * pmmp1 - (i + m - 1) * pmm) / (i - m);
+    pmm = pmmp1;
+    pmmp1 = pll;
+  }
+  return pll;
+}
+
+Real HarmonicNorm(int l, int m) {
+  const Real ln_ratio = std::lgamma(l - m + 1.0) - std::lgamma(l + m + 1.0);
+  const Real norm_sq = ((2.0 * l + 1.0) / (4.0 * PI)) * std::exp(ln_ratio);
+  return std::sqrt(norm_sq);
+}
+
+Real EvalSphHarmNoise(Real r, Real theta, Real phi) {
+  if (!g_pert_ready) {
+    return 0.0;
+  }
+  const Real cos_t = std::cos(theta);
+  const Real r_scaled = ScaleRadius(r);
+  Real noise = 0.0;
+  const int num_coeff = PerturbationCoefficientCount();
+  std::size_t idx_base = 0;
+
+  for (int n = 0; n < g_pert_radial_modes; ++n) {
+    std::size_t idx = idx_base;
+    const Real kr = g_pert_k_values[n] * r_scaled;
+    for (int l = 0; l <= g_pert_lmax; ++l) {
+      const Real level_scale = 1.0 / std::sqrt(2.0 * l + 1.0);
+      const Real radial_fn = NoiseSphericalBessel(l, kr);
+      const Real radial_val = radial_fn * g_pert_radial_weight[n];
+      if (!std::isfinite(radial_fn) ||
+          std::abs(radial_val) > kPerturbationWarningThreshold) {
+        std::cout << "### Warning in precipitator.cpp: large radial term "
+                  << "(l=" << l << ", mode=" << n << ", kr=" << kr
+                  << ", r=" << r << ", r_scaled=" << r_scaled
+                  << ", radial_fn=" << radial_fn
+                  << ", weight=" << g_pert_radial_weight[n]
+                  << ", radial_val=" << radial_val << ")\n";
+      }
+      const Real norm0 = HarmonicNorm(l, 0);
+      const Real plm0 = AssociatedLegendre(l, 0, cos_t);
+      const Real coeff0 = g_pert_coeff_cos[idx++];
+      noise += coeff0 * level_scale * norm0 * plm0 * radial_val;
+
+      for (int m = 1; m <= l; ++m) {
+        const Real norm = HarmonicNorm(l, m);
+        const Real plm = AssociatedLegendre(l, m, cos_t);
+        const Real base = level_scale * norm * plm * radial_val;
+        const Real coeff_c = g_pert_coeff_cos[idx];
+        const Real coeff_s = g_pert_coeff_sin[idx];
+        const Real phase = static_cast<Real>(m) * phi;
+        noise += kSqrtTwo * base *
+                 (coeff_c * std::cos(phase) + coeff_s * std::sin(phase));
+        ++idx;
+      }
+    }
+    idx_base += static_cast<std::size_t>(num_coeff);
+  }
+  return noise;
+}
+
+void InitializePerturbationTables(const Mesh &mesh) {
+  if (!PerturbationsActive()) {
+    return;
+  }
+  g_pert_radius_min = mesh.mesh_size.x1min;
+  g_pert_radius_max = mesh.mesh_size.x1max;
+  if (g_pert_ready) {
+    return;
+  }
+
+  const int num_coeff = PerturbationCoefficientCount();
+  if (num_coeff <= 0) {
+    std::stringstream msg;
+    msg << "### FATAL ERROR in precipitator.cpp" << std::endl
+        << "Invalid perturbation configuration: lmax=" << g_pert_lmax;
+    ATHENA_ERROR(msg);
+  }
+
+  const std::size_t total_coeff =
+      static_cast<std::size_t>(g_pert_radial_modes) *
+      static_cast<std::size_t>(num_coeff);
+  g_pert_coeff_cos.assign(total_coeff, 0.0);
+  g_pert_coeff_sin.assign(total_coeff, 0.0);
+  g_pert_k_values.assign(g_pert_radial_modes, 0.0);
+  g_pert_radial_weight.assign(g_pert_radial_modes, 0.0);
+
+  g_pert_state = g_pert_seed;
+  Real kmin = g_pert_kmin;
+  Real kmax = g_pert_kmax;
+  if (kmin <= 0.0) {
+    kmin = 0.5;
+  }
+  if (kmax <= kmin) {
+    kmax = kmin + 1.0;
+  }
+  const Real span = kmax - kmin;
+  const Real denom =
+      (g_pert_radial_modes > 1) ? static_cast<Real>(g_pert_radial_modes - 1)
+                                : 1.0;
+  Real dk_eff = span / denom;
+  if (dk_eff <= 0.0) {
+    dk_eff = kmin;
+  }
+
+  for (int n = 0; n < g_pert_radial_modes; ++n) {
+    const Real kval =
+        (g_pert_radial_modes > 1) ? (kmin + n * dk_eff) : kmin;
+    g_pert_k_values[n] = kval;
+    g_pert_radial_weight[n] = std::sqrt(kval * kval * dk_eff);
+    for (int i = 0; i < num_coeff; ++i) {
+      const std::size_t idx =
+          static_cast<std::size_t>(n) * static_cast<std::size_t>(num_coeff) +
+          static_cast<std::size_t>(i);
+      g_pert_coeff_cos[idx] = RandomSymmetric();
+      g_pert_coeff_sin[idx] = RandomSymmetric();
+    }
+  }
+  g_pert_ready = true;
+}
+
+void ApplyDensityPerturbations(MeshBlock *pmb) {
+  if (!PerturbationsActive()) {
+    return;
+  }
+  InitializePerturbationTables(*pmb->pmy_mesh);
+  if (!g_pert_ready) {
+    return;
+  }
+
+  auto &prim = pmb->phydro->w;
+  Coordinates *coord = pmb->pcoord;
+
+  for (int k = pmb->ks; k <= pmb->ke; ++k) {
+    for (int j = pmb->js; j <= pmb->je; ++j) {
+      for (int i = pmb->is; i <= pmb->ie; ++i) {
+        const Real r = coord->x1v(i);
+        Real theta = 0.0;
+        if (pmb->block_size.nx2 > 1) {
+          theta = coord->x2v(j);
+        } else {
+          theta = 0.5 * (coord->x2f(j) + coord->x2f(j + 1));
+        }
+        Real phi = 0.0;
+        if (pmb->block_size.nx3 > 1) {
+          phi = coord->x3v(k);
+        } else {
+          phi = 0.5 * (coord->x3f(k) + coord->x3f(k + 1));
+        }
+
+        const Real delta = g_pert_sigma * EvalSphHarmNoise(r, theta, phi);
+        if (!std::isfinite(delta) ||
+            std::abs(delta) > kPerturbationWarningThreshold) {
+          std::cout << "### Warning in precipitator.cpp: large density perturbation "
+                    << "delta=" << delta << " at (r=" << r
+                    << ", theta=" << theta << ", phi=" << phi << ")\n";
+        }
+
+        const Real rho0 = prim(IDN, k, j, i);
+        const Real rho_new = rho0 * (1.0 + delta);
+        if (rho_new <= 0.0) {
+          std::cout << "### Warning in precipitator.cpp: density perturbation produced "
+                    << "rho <= 0 (rho0=" << rho0 << ", delta=" << delta
+                    << ", r=" << r << ", theta=" << theta
+                    << ", phi=" << phi << ")\n";
+        }
+        prim(IDN, k, j, i) = rho_new;
+      }
+    }
+  }
+}
+
 } // namespace
 
 // Forward declaration so we can enroll it before the definition appears.
@@ -503,6 +806,57 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
         lambda_cgs * SQR(hydrogen_mass_fraction / hydrogen_mass_cgs);
     g_powerlaw_lambda_code =
         lambda_mass_cgs * SQR(density_cgs) * time_cgs / energy_density_cgs;
+  }
+
+  g_pert_radius_min = mesh_size.x1min;
+  g_pert_radius_max = mesh_size.x1max;
+  const int pert_flag =
+      pin->GetOrAddInteger("precipitator", "enable_fourier_bessel_perturbations", 0);
+  g_pert_sigma = pin->GetOrAddReal("precipitator", "perturbation_sigma", 0.01);
+  g_pert_lmax = pin->GetOrAddInteger("precipitator", "perturbation_lmax", 12);
+  g_pert_radial_modes =
+      pin->GetOrAddInteger("precipitator", "perturbation_radial_modes", 16);
+  g_pert_kmin = pin->GetOrAddReal("precipitator", "perturbation_kmin", 1.0);
+  g_pert_kmax = pin->GetOrAddReal("precipitator", "perturbation_kmax", 16.0);
+  g_pert_small_kr_threshold =
+      pin->GetOrAddReal("precipitator", "perturbation_small_kr_threshold", 1.0);
+  const std::string seed_string =
+      pin->GetOrAddString("precipitator", "perturbation_seed",
+                          "88172645463393265");
+  try {
+    g_pert_seed = static_cast<std::uint64_t>(std::stoull(seed_string));
+  } catch (const std::exception &ex) {
+    std::stringstream msg;
+    msg << "### FATAL ERROR in precipitator.cpp" << std::endl
+        << "Invalid perturbation_seed value: " << seed_string << std::endl
+        << ex.what();
+    ATHENA_ERROR(msg);
+  }
+  g_enable_density_perturbations =
+      (pert_flag != 0) && (g_pert_sigma != 0.0);
+  g_pert_ready = false;
+  if (g_enable_density_perturbations) {
+    if (g_pert_lmax < 0) {
+      std::stringstream msg;
+      msg << "### FATAL ERROR in precipitator.cpp" << std::endl
+          << "perturbation_lmax must be >= 0.";
+      ATHENA_ERROR(msg);
+    }
+    if (g_pert_radial_modes <= 0) {
+      std::stringstream msg;
+      msg << "### FATAL ERROR in precipitator.cpp" << std::endl
+          << "perturbation_radial_modes must be > 0.";
+      ATHENA_ERROR(msg);
+    }
+    if (g_pert_small_kr_threshold <= 0.0) {
+      g_pert_small_kr_threshold = 1.0;
+    }
+  } else {
+    g_pert_ready = false;
+    g_pert_coeff_cos.clear();
+    g_pert_coeff_sin.clear();
+    g_pert_k_values.clear();
+    g_pert_radial_weight.clear();
   }
 
   EnrollUserExplicitSourceFunction(PrecipitatorGravity);
@@ -585,6 +939,8 @@ void MeshBlock::ProblemGenerator(ParameterInput *pin) {
       }
     }
   }
+
+  ApplyDensityPerturbations(this);
 
   auto require_finite = [&](const char *label, int k, int j, int i, Real value) {
     if (!std::isfinite(value)) {
