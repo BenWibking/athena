@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 #include <cstring>
+#include <limits>
 
 // Athena++ headers
 #include "../athena.hpp"
@@ -115,6 +116,8 @@ int g_uniform_init = 0;
 Real g_uniform_height = 0.0;
 Real g_gamma = 0.0;
 Real g_gm1 = 0.0;
+bool g_enable_powerlaw_cooling = false;
+Real g_powerlaw_lambda_code = 0.0;
 
 std::string g_force_free_param_file;
 bool g_force_free_loaded = false;
@@ -447,6 +450,7 @@ void PrecipitatorGravity(MeshBlock *pmb, const Real time, const Real dt,
 void Mesh::InitUserMeshData(ParameterInput *pin) {
   g_gamma = pin->GetReal("hydro", "gamma");
   g_gm1 = g_gamma - 1.0;
+  Units *units = punit;
 
   const std::string profile_filename = pin->GetString("precipitator", "hse_profile_filename");
   g_profile = std::unique_ptr<PrecipitatorProfile>(
@@ -468,6 +472,38 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
     ATHENA_ERROR(msg);
   }
 #endif
+
+  g_enable_powerlaw_cooling =
+      (pin->GetOrAddInteger("precipitator", "enable_powerlaw_cooling", 0) != 0);
+  g_powerlaw_lambda_code = 0.0;
+  if (g_enable_powerlaw_cooling) {
+    if (units == nullptr) {
+      std::stringstream msg;
+      msg << "### FATAL ERROR in precipitator.cpp" << std::endl
+          << "Units object must be configured before enabling power-law cooling.";
+      ATHENA_ERROR(msg);
+    }
+    // Default Lambda matches the AthenaPK precipitator cooling table (1e-22 erg cm^3/s).
+    const Real lambda_cgs =
+        pin->GetOrAddReal("precipitator", "powerlaw_lambda_cgs", 1.0e-22);
+    if (lambda_cgs <= 0.0) {
+      std::stringstream msg;
+      msg << "### FATAL ERROR in precipitator.cpp" << std::endl
+          << "powerlaw_lambda_cgs must be positive when enable_powerlaw_cooling is set.";
+      ATHENA_ERROR(msg);
+    }
+    const Real He_mass_fraction = pin->GetOrAddReal("hydro", "He_mass_fraction", 0.25);
+    const Real hydrogen_mass_fraction = 1.0 - He_mass_fraction;
+    const Real density_cgs = units->code_density_cgs;
+    const Real energy_density_cgs = units->code_energydensity_cgs;
+    const Real time_cgs = units->code_time_cgs;
+    const Real hydrogen_mass_cgs = Constants::hydrogen_mass_cgs;
+    // Convert number-density cooling coefficient (erg cm^3/s) -> mass-density form.
+    const Real lambda_mass_cgs =
+        lambda_cgs * SQR(hydrogen_mass_fraction / hydrogen_mass_cgs);
+    g_powerlaw_lambda_code =
+        lambda_mass_cgs * SQR(density_cgs) * time_cgs / energy_density_cgs;
+  }
 
   EnrollUserExplicitSourceFunction(PrecipitatorGravity);
   return;
@@ -623,6 +659,59 @@ void MeshBlock::ProblemGenerator(ParameterInput *pin) {
 }
 
 //========================================================================================
+//! \fn void MeshBlock::InitUserMeshBlockData(ParameterInput *pin)
+//! \brief Allocate auxiliary cooling-time output when power-law cooling is active
+//========================================================================================
+void MeshBlock::InitUserMeshBlockData(ParameterInput *pin) {
+  if (g_enable_powerlaw_cooling) {
+    AllocateUserOutputVariables(1);
+    SetUserOutputVariableName(0, "tcool_myr");
+  }
+}
+
+//========================================================================================
+//! \fn void MeshBlock::UserWorkBeforeOutput(ParameterInput *pin)
+//! \brief Fill auxiliary cooling-time output in Myr
+//========================================================================================
+void MeshBlock::UserWorkBeforeOutput(ParameterInput *pin) {
+  if (!g_enable_powerlaw_cooling || nuser_out_var == 0) {
+    return;
+  }
+
+  Units *units = pmy_mesh->punit;
+  if (units == nullptr) {
+    std::stringstream msg;
+    msg << "### FATAL ERROR in precipitator.cpp" << std::endl
+        << "Units object is not initialized.";
+    ATHENA_ERROR(msg);
+  }
+
+  const Real gm1 = g_gm1;
+  const Real million_yr_code = units->million_yr_code;
+  const Real lambda = g_powerlaw_lambda_code;
+  auto &prim = phydro->w;
+
+  for (int k = ks; k <= ke; ++k) {
+    for (int j = js; j <= je; ++j) {
+      for (int i = is; i <= ie; ++i) {
+        const Real rho = prim(IDN, k, j, i);
+        const Real pressure = prim(IPR, k, j, i);
+        Real tcool_myr = std::numeric_limits<Real>::infinity();
+        if (rho > 0.0 && pressure > 0.0 && lambda > 0.0 && million_yr_code > 0.0) {
+          const Real eint = pressure / gm1;
+          const Real denom = lambda * rho * rho;
+          if (denom > 0.0) {
+            const Real tcool_code = eint / denom;
+            tcool_myr = tcool_code / million_yr_code;
+          }
+        }
+        user_out_var(0, k, j, i) = tcool_myr;
+      }
+    }
+  }
+}
+
+//========================================================================================
 //! \fn void Mesh::UserWorkInLoop()
 //! \brief Check for non-finite magnetic fields each time step.
 //========================================================================================
@@ -684,17 +773,23 @@ void PrecipitatorGravity(MeshBlock *pmb, const Real time, const Real dt,
                          const AthenaArray<Real> &prim, const AthenaArray<Real> &prim_scalar,
                          const AthenaArray<Real> &bcc, AthenaArray<Real> &cons,
                          AthenaArray<Real> &cons_scalar) {
-  if (g_uniform_init == 1 || !g_profile) {
+  const bool gravity_enabled = (g_uniform_init == 0) && static_cast<bool>(g_profile);
+  const bool cooling_enabled = g_enable_powerlaw_cooling && (g_powerlaw_lambda_code > 0.0);
+  if (!gravity_enabled && !cooling_enabled) {
     return;
   }
 
-  Units *units = pmb->pmy_mesh->punit;
-  if (units == nullptr) {
-    std::stringstream msg;
-    msg << "### FATAL ERROR in precipitator.cpp" << std::endl
-        << "Units object is not initialized.";
-    ATHENA_ERROR(msg);
+  Units *units = nullptr;
+  if (gravity_enabled) {
+    units = pmb->pmy_mesh->punit;
+    if (units == nullptr) {
+      std::stringstream msg;
+      msg << "### FATAL ERROR in precipitator.cpp" << std::endl
+          << "Units object is not initialized.";
+      ATHENA_ERROR(msg);
+    }
   }
+  Coordinates *pcoord = pmb->pcoord;
 
   for (int k = pmb->ks; k <= pmb->ke; ++k) {
     for (int j = pmb->js; j <= pmb->je; ++j) {
@@ -704,33 +799,50 @@ void PrecipitatorGravity(MeshBlock *pmb, const Real time, const Real dt,
         const Real mom2 = cons(IM2, k, j, i);
         const Real mom3 = cons(IM3, k, j, i);
         const Real Etot = cons(IEN, k, j, i);
-        const Real KE = 0.5 * (SQR(mom1) + SQR(mom2) + SQR(mom3)) / std::max(rho, TINY_NUMBER);
-        const Real Eint = Etot - KE;
-        const Real pressure = Eint * g_gm1;
-        if (pressure <= 0.0) {
-          continue;
+        const Real inv_rho = 1.0 / std::max(rho, TINY_NUMBER);
+        const Real KE = 0.5 * (SQR(mom1) + SQR(mom2) + SQR(mom3)) * inv_rho;
+        const Real Eint_total = Etot - KE;
+        const Real pressure = Eint_total * g_gm1;
+
+        if (gravity_enabled && pressure > 0.0) {
+          const Real dx1 = pcoord->dx1v(i);
+          const Real phi_center = PotentialInCodeUnits(pcoord->x1v(i), units);
+          const Real phi_minus = PotentialInCodeUnits(pcoord->x1f(i), units);
+          const Real phi_plus = PotentialInCodeUnits(pcoord->x1f(i + 1), units);
+
+          const Real kT_over_mu = pressure * inv_rho;
+          if (kT_over_mu > 0.0) {
+            const Real p_hse_plus =
+                pressure * std::exp(-(phi_plus - phi_center) / kT_over_mu);
+            const Real p_hse_minus =
+                pressure * std::exp(-(phi_minus - phi_center) / kT_over_mu);
+
+            cons(IM1, k, j, i) += dt * (p_hse_plus - p_hse_minus) / dx1;
+
+            const Real vr = mom1 * inv_rho;
+            cons(IEN, k, j, i) -= dt * rho * vr * (phi_plus - phi_minus) / dx1;
+          }
         }
 
-        Coordinates *pcoord = pmb->pcoord;
-        const Real dx1 = pcoord->dx1v(i);
-        const Real phi_center = PotentialInCodeUnits(pcoord->x1v(i), units);
-        const Real phi_minus = PotentialInCodeUnits(pcoord->x1f(i), units);
-        const Real phi_plus = PotentialInCodeUnits(pcoord->x1f(i + 1), units);
-
-        const Real kT_over_mu = pressure / std::max(rho, TINY_NUMBER);
-        if (kT_over_mu <= 0.0) {
-          continue;
+        if (cooling_enabled) {
+          Real available_eint = Eint_total;
+#if MAGNETIC_FIELDS_ENABLED
+          const Real b1 = bcc(IB1, k, j, i);
+          const Real b2 = bcc(IB2, k, j, i);
+          const Real b3 = bcc(IB3, k, j, i);
+          available_eint -= 0.5 * (SQR(b1) + SQR(b2) + SQR(b3));
+#endif
+          const Real thermal_energy = std::max(available_eint, 0.0);
+          if (thermal_energy > 0.0) {
+            const Real cooling_strength = g_powerlaw_lambda_code * rho * rho;
+            if (cooling_strength > 0.0) {
+              // Exact integration of de/dt = -rho^2 Lambda with constant Lambda
+              const Real eint_new = std::max(thermal_energy - dt * cooling_strength, 0.0);
+              const Real dE = thermal_energy - eint_new;
+              cons(IEN, k, j, i) -= dE;
+            }
+          }
         }
-
-        const Real p_hse_plus =
-            pressure * std::exp(-(phi_plus - phi_center) / kT_over_mu);
-        const Real p_hse_minus =
-            pressure * std::exp(-(phi_minus - phi_center) / kT_over_mu);
-
-        cons(IM1, k, j, i) += dt * (p_hse_plus - p_hse_minus) / dx1;
-
-        const Real vr = mom1 / std::max(rho, TINY_NUMBER);
-        cons(IEN, k, j, i) -= dt * rho * vr * (phi_plus - phi_minus) / dx1;
       }
     }
   }
