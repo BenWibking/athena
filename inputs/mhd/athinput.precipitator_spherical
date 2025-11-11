@@ -30,19 +30,19 @@ xorder 	   = 2c
 ncycle_out = 1
 
 <mesh>
-nx1    = 32
+nx1    = 64
 x1min  = 1.0
 x1max  = 100.0
 ix1_bc = reflecting
 ox1_bc = reflecting
 
-nx2    = 32
+nx2    = 64
 x2min  = 0.0
 x2max  = 3.141592653589793
 ix2_bc = polar
 ox2_bc = polar
 
-nx3    = 32
+nx3    = 64
 x3min  = 0.0
 x3max  = 6.2831853071795862
 ix3_bc = periodic
