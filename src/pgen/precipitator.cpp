@@ -8,6 +8,9 @@
 //========================================================================================
 
 // C headers
+#ifdef MPI_PARALLEL
+#include <mpi.h>
+#endif
 
 // C++ headers
 #include <algorithm>
@@ -121,6 +124,21 @@ Real g_gamma = 0.0;
 Real g_gm1 = 0.0;
 bool g_enable_powerlaw_cooling = false;
 Real g_powerlaw_lambda_code = 0.0;
+bool g_enable_magic_heating = false;
+Real g_magic_target_temperature = 0.0;
+Real g_magic_Kp = 0.0;
+Real g_magic_h_smooth = 1.0;
+Real g_magic_mu = 0.0;
+Real g_magic_mmw_cgs = 0.0;
+Real g_magic_mmw_code = 0.0;
+Real g_magic_c_v = 0.0;
+int g_magic_profile_bins = 0;
+Real g_magic_profile_x3min = 0.0;
+Real g_magic_profile_inv_dz = 0.0;
+Real g_magic_profile_time = std::numeric_limits<Real>::quiet_NaN();
+Real g_magic_profile_dt = std::numeric_limits<Real>::quiet_NaN();
+bool g_magic_profile_ready = false;
+std::vector<Real> g_magic_error_profile;
 
 std::string g_force_free_param_file;
 bool g_force_free_loaded = false;
@@ -181,6 +199,163 @@ Real PotentialInCodeUnits(Real coord_value, const Units *units) {
   const Real code_potential_cgs = (length_cgs / (time_cgs * time_cgs)) * length_cgs;
   const Real r_cgs = coord_value * length_cgs;
   return g_profile->Phi(r_cgs) / code_potential_cgs;
+}
+
+Real SampleBackgroundRadiusCgs(Real radius_code, const Units *units) {
+  if (g_uniform_init == 1) {
+    return g_uniform_height;
+  }
+  if (units == nullptr) {
+    return 0.0;
+  }
+  return radius_code * units->code_length_cgs;
+}
+
+Real SampleBackgroundDensityCode(Real radius_code, const Units *units) {
+  if (!g_profile || units == nullptr) {
+    return 0.0;
+  }
+  const Real r_cgs = SampleBackgroundRadiusCgs(radius_code, units);
+  const Real rho_cgs = g_profile->Density(r_cgs);
+  return rho_cgs / units->code_density_cgs;
+}
+
+Real SampleBackgroundPressureCode(Real radius_code, const Units *units) {
+  if (!g_profile || units == nullptr) {
+    return 0.0;
+  }
+  const Real r_cgs = SampleBackgroundRadiusCgs(radius_code, units);
+  const Real pressure_cgs = g_profile->Pressure(r_cgs);
+  return pressure_cgs / units->code_pressure_cgs;
+}
+
+Real ComputeCellTemperature(Real rho_code, Real pressure_code, const Units &units) {
+  if (rho_code <= 0.0) {
+    return 0.0;
+  }
+  const Real rho_cgs = rho_code * units.code_density_cgs;
+  if (rho_cgs <= 0.0) {
+    return 0.0;
+  }
+  const Real pressure_cgs = pressure_code * units.code_pressure_cgs;
+  return (pressure_cgs * g_magic_mmw_cgs) / (Constants::k_boltzmann_cgs * rho_cgs);
+}
+
+Real MagicHeatingTaper(Real coord_value) {
+  if (g_magic_h_smooth <= 0.0) {
+    return 1.0;
+  }
+  const Real arg = std::abs(coord_value) / g_magic_h_smooth;
+  if (arg <= 0.0) {
+    return 0.0;
+  }
+  const Real th = std::tanh(arg);
+  return SQR(SQR(th));
+}
+
+void UpdateMagicHeatingProfile(Mesh *mesh, Real time, Real dt) {
+  if (!g_enable_magic_heating || g_magic_profile_bins <= 0) {
+    return;
+  }
+  if (g_magic_profile_ready && time == g_magic_profile_time && dt == g_magic_profile_dt) {
+    return;
+  }
+
+  Units *units = mesh->punit;
+  if (units == nullptr) {
+    std::stringstream msg;
+    msg << "### FATAL ERROR in precipitator.cpp" << std::endl
+        << "Units object must be configured before magic heating can run.";
+    ATHENA_ERROR(msg);
+  }
+
+  const int num_bins = g_magic_profile_bins;
+  if (static_cast<int>(g_magic_error_profile.size()) != num_bins) {
+    g_magic_error_profile.assign(static_cast<std::size_t>(num_bins), 0.0);
+  }
+
+  std::vector<Real> sum(static_cast<std::size_t>(num_bins), 0.0);
+  std::vector<Real> volume(static_cast<std::size_t>(num_bins), 0.0);
+
+  const Real x3min = mesh->mesh_size.x3min;
+  const Real x3max = mesh->mesh_size.x3max;
+  const Real extent = x3max - x3min;
+  const bool has_extent = (num_bins > 1) && (extent > 0.0);
+  const Real inv_dz = has_extent ? static_cast<Real>(num_bins) / extent : 0.0;
+
+  for (int block = 0; block < mesh->nblocal; ++block) {
+    MeshBlock *pmb = mesh->my_blocks(block);
+    if (pmb == nullptr || pmb->phydro == nullptr) {
+      continue;
+    }
+    auto &prim = pmb->phydro->w;
+    Coordinates *coord = pmb->pcoord;
+    for (int k = pmb->ks; k <= pmb->ke; ++k) {
+      const Real z = coord->x3v(k);
+      int idx = has_extent ? static_cast<int>((z - x3min) * inv_dz) : 0;
+      if (idx < 0) {
+        idx = 0;
+      }
+      if (idx >= num_bins) {
+        idx = num_bins - 1;
+      }
+      for (int j = pmb->js; j <= pmb->je; ++j) {
+        for (int i = pmb->is; i <= pmb->ie; ++i) {
+          const Real rho = prim(IDN, k, j, i);
+          const Real pressure = prim(IPR, k, j, i);
+          const Real temperature = ComputeCellTemperature(rho, pressure, *units);
+          const Real err = temperature - g_magic_target_temperature;
+          const Real cell_volume = coord->GetCellVolume(k, j, i);
+          sum[static_cast<std::size_t>(idx)] += err * cell_volume;
+          volume[static_cast<std::size_t>(idx)] += cell_volume;
+        }
+      }
+    }
+  }
+
+#ifdef MPI_PARALLEL
+  MPI_Allreduce(MPI_IN_PLACE, sum.data(), num_bins, MPI_ATHENA_REAL, MPI_SUM,
+                MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE, volume.data(), num_bins, MPI_ATHENA_REAL, MPI_SUM,
+                MPI_COMM_WORLD);
+#endif
+
+  for (int n = 0; n < num_bins; ++n) {
+    if (volume[static_cast<std::size_t>(n)] > 0.0) {
+      g_magic_error_profile[static_cast<std::size_t>(n)] =
+          sum[static_cast<std::size_t>(n)] / volume[static_cast<std::size_t>(n)];
+    } else {
+      g_magic_error_profile[static_cast<std::size_t>(n)] = 0.0;
+    }
+  }
+
+  g_magic_profile_ready = true;
+  g_magic_profile_time = time;
+  g_magic_profile_dt = dt;
+  g_magic_profile_x3min = x3min;
+  g_magic_profile_inv_dz = has_extent ? inv_dz : 0.0;
+}
+
+Real SampleMagicHeatingError(Real coord_value) {
+  if (!g_magic_profile_ready || g_magic_error_profile.empty()) {
+    return 0.0;
+  }
+  if (g_magic_profile_bins <= 1 || g_magic_profile_inv_dz == 0.0) {
+    return g_magic_error_profile.front();
+  }
+  Real idx_f = (coord_value - g_magic_profile_x3min) * g_magic_profile_inv_dz;
+  if (idx_f <= 0.0) {
+    return g_magic_error_profile.front();
+  }
+  const Real max_index = static_cast<Real>(g_magic_profile_bins - 1);
+  if (idx_f >= max_index) {
+    return g_magic_error_profile.back();
+  }
+  const int idx = static_cast<int>(idx_f);
+  const Real frac = idx_f - static_cast<Real>(idx);
+  const Real a = g_magic_error_profile[static_cast<std::size_t>(idx)];
+  const Real b = g_magic_error_profile[static_cast<std::size_t>(idx + 1)];
+  return a + frac * (b - a);
 }
 
 std::string Trim(const std::string &input) {
@@ -776,14 +951,23 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
   }
 #endif
 
+  const Real He_mass_fraction = pin->GetOrAddReal("hydro", "He_mass_fraction", 0.25);
+  const Real hydrogen_mass_fraction = 1.0 - He_mass_fraction;
+
   g_enable_powerlaw_cooling =
       (pin->GetOrAddInteger("precipitator", "enable_powerlaw_cooling", 0) != 0);
+  const std::string heating_mode =
+      pin->GetOrAddString("precipitator", "enable_heating", "none");
+  g_enable_magic_heating = (heating_mode == "magic");
+
+  const bool need_powerlaw_coeff =
+      g_enable_powerlaw_cooling || g_enable_magic_heating;
   g_powerlaw_lambda_code = 0.0;
-  if (g_enable_powerlaw_cooling) {
+  if (need_powerlaw_coeff) {
     if (units == nullptr) {
       std::stringstream msg;
       msg << "### FATAL ERROR in precipitator.cpp" << std::endl
-          << "Units object must be configured before enabling power-law cooling.";
+          << "Units object must be configured before enabling cooling/heating.";
       ATHENA_ERROR(msg);
     }
     // Default Lambda matches the AthenaPK precipitator cooling table (1e-22 erg cm^3/s).
@@ -792,11 +976,9 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
     if (lambda_cgs <= 0.0) {
       std::stringstream msg;
       msg << "### FATAL ERROR in precipitator.cpp" << std::endl
-          << "powerlaw_lambda_cgs must be positive when enable_powerlaw_cooling is set.";
+          << "powerlaw_lambda_cgs must be positive when cooling/heating is enabled.";
       ATHENA_ERROR(msg);
     }
-    const Real He_mass_fraction = pin->GetOrAddReal("hydro", "He_mass_fraction", 0.25);
-    const Real hydrogen_mass_fraction = 1.0 - He_mass_fraction;
     const Real density_cgs = units->code_density_cgs;
     const Real energy_density_cgs = units->code_energydensity_cgs;
     const Real time_cgs = units->code_time_cgs;
@@ -806,6 +988,46 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
         lambda_cgs * SQR(hydrogen_mass_fraction / hydrogen_mass_cgs);
     g_powerlaw_lambda_code =
         lambda_mass_cgs * SQR(density_cgs) * time_cgs / energy_density_cgs;
+  }
+
+  if (g_enable_magic_heating) {
+    if (units == nullptr) {
+      std::stringstream msg;
+      msg << "### FATAL ERROR in precipitator.cpp" << std::endl
+          << "Units object must be configured before enabling magic heating.";
+      ATHENA_ERROR(msg);
+    }
+    if (mesh_size.nx3 <= 0) {
+      std::stringstream msg;
+      msg << "### FATAL ERROR in precipitator.cpp" << std::endl
+          << "Magic heating requires mesh_size.nx3 > 0 to define a vertical profile.";
+      ATHENA_ERROR(msg);
+    }
+    g_magic_target_temperature =
+        pin->GetOrAddReal("precipitator", "thermostat_temperature", 1.0e7);
+    g_magic_Kp = pin->GetOrAddReal("precipitator", "thermostat_Kp", 0.0);
+    g_magic_h_smooth =
+        pin->GetOrAddReal("precipitator", "h_smooth_heatcool", 1.0);
+    if (g_magic_h_smooth <= 0.0) {
+      g_magic_h_smooth = 1.0;
+    }
+    g_magic_mu = 1.0 / (He_mass_fraction * 0.75 + hydrogen_mass_fraction * 2.0);
+    g_magic_mmw_cgs = g_magic_mu * Constants::hydrogen_mass_cgs;
+    g_magic_mmw_code = g_magic_mmw_cgs * units->gram_code;
+    g_magic_c_v = (units->k_boltzmann_code / g_magic_mmw_code) / g_gm1;
+    g_magic_profile_bins = mesh_size.nx3;
+    g_magic_error_profile.assign(static_cast<std::size_t>(g_magic_profile_bins), 0.0);
+    g_magic_profile_ready = false;
+    g_magic_profile_time = std::numeric_limits<Real>::quiet_NaN();
+    g_magic_profile_dt = std::numeric_limits<Real>::quiet_NaN();
+    g_magic_profile_x3min = mesh_size.x3min;
+    g_magic_profile_inv_dz = 0.0;
+  } else {
+    g_magic_error_profile.clear();
+    g_magic_profile_bins = 0;
+    g_magic_profile_ready = false;
+    g_magic_profile_time = std::numeric_limits<Real>::quiet_NaN();
+    g_magic_profile_dt = std::numeric_limits<Real>::quiet_NaN();
   }
 
   g_pert_radius_min = mesh_size.x1min;
@@ -1198,12 +1420,15 @@ void PrecipitatorGravity(MeshBlock *pmb, const Real time, const Real dt,
                          AthenaArray<Real> &cons_scalar) {
   const bool gravity_enabled = (g_uniform_init == 0) && static_cast<bool>(g_profile);
   const bool cooling_enabled = g_enable_powerlaw_cooling && (g_powerlaw_lambda_code > 0.0);
-  if (!gravity_enabled && !cooling_enabled) {
+  const bool heating_enabled = g_enable_magic_heating && (g_powerlaw_lambda_code > 0.0) &&
+                               (g_magic_profile_bins > 0) && (g_magic_c_v > 0.0) &&
+                               (g_magic_Kp != 0.0);
+  if (!gravity_enabled && !cooling_enabled && !heating_enabled) {
     return;
   }
 
   Units *units = nullptr;
-  if (gravity_enabled) {
+  if (gravity_enabled || heating_enabled) {
     units = pmb->pmy_mesh->punit;
     if (units == nullptr) {
       std::stringstream msg;
@@ -1213,6 +1438,9 @@ void PrecipitatorGravity(MeshBlock *pmb, const Real time, const Real dt,
     }
   }
   Coordinates *pcoord = pmb->pcoord;
+  if (heating_enabled) {
+    UpdateMagicHeatingProfile(pmb->pmy_mesh, time, dt);
+  }
 
   for (int k = pmb->ks; k <= pmb->ke; ++k) {
     for (int j = pmb->js; j <= pmb->je; ++j) {
@@ -1263,6 +1491,35 @@ void PrecipitatorGravity(MeshBlock *pmb, const Real time, const Real dt,
               const Real eint_new = std::max(thermal_energy - dt * cooling_strength, 0.0);
               const Real dE = thermal_energy - eint_new;
               cons(IEN, k, j, i) -= dE;
+            }
+          }
+        }
+
+        if (heating_enabled && g_magic_profile_ready) {
+          const Real z = pcoord->x3v(k);
+          const Real err = SampleMagicHeatingError(z);
+          if (err != 0.0) {
+            const Real taper = MagicHeatingTaper(z);
+            if (taper > 0.0) {
+              const Real radius_code = pcoord->x1v(i);
+              const Real rho_bg = SampleBackgroundDensityCode(radius_code, units);
+              const Real pressure_bg = SampleBackgroundPressureCode(radius_code, units);
+              Real inv_t_cool = 0.0;
+              if (rho_bg > 0.0 && pressure_bg > 0.0 && g_powerlaw_lambda_code > 0.0) {
+                const Real thermal_bg = pressure_bg / g_gm1;
+                const Real cooling_strength = g_powerlaw_lambda_code * rho_bg * rho_bg;
+                if (thermal_bg > 0.0 && cooling_strength > 0.0) {
+                  const Real t_cool = thermal_bg / cooling_strength;
+                  if (t_cool > 0.0) {
+                    inv_t_cool = 1.0 / t_cool;
+                  }
+                }
+              }
+              if (inv_t_cool > 0.0) {
+                const Real dE_dt =
+                    -taper * rho * g_magic_c_v * inv_t_cool * (g_magic_Kp * err);
+                cons(IEN, k, j, i) += dt * dE_dt;
+              }
             }
           }
         }

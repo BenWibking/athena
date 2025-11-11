@@ -26,6 +26,7 @@ cfl_number = 0.2
 nlim       = 20000
 tlim       = 1.0e3
 integrator = rk2
+xorder 	   = 2c
 ncycle_out = 1
 
 <mesh>
@@ -54,6 +55,8 @@ nx3 = 32
 
 <hydro>
 gamma = 1.6666666666666667
+pfloor = 1000.0
+dfloor = 1454.4065594167007     # Msun kpc^(-3) == 1e-4 cm^{-3}
 
 <units>
 unit_system = custom
@@ -69,10 +72,14 @@ enable_powerlaw_cooling = 1
 powerlaw_lambda_cgs = 1e-22
 
 enable_fourier_bessel_perturbations = 1
-perturbation_sigma = 0.1
+perturbation_sigma = 0.01
 perturbation_lmax = 12
 perturbation_radial_modes = 16
 perturbation_kmin = 1.0
 perturbation_kmax = 16.0
 perturbation_small_kr_threshold = 1.0
 perturbation_seed = 88172645463393265
+enable_heating = magic
+thermostat_temperature = 1.0e7
+thermostat_Kp = 10.0
+h_smooth_heatcool = 5.0
