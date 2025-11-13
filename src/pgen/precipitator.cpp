@@ -164,10 +164,13 @@ std::vector<Real> g_pert_k_values;
 std::vector<Real> g_pert_radial_weight;
 
 constexpr const char *kDensityContrastName = "delta_rho_over_rho_bar";
+constexpr const char *kTemperatureOutputName = "temperature_K";
 std::vector<Real> g_radial_density_profile;
 Real g_radial_density_time = std::numeric_limits<Real>::quiet_NaN();
 int g_radial_density_cycle = -1;
 bool g_radial_density_ready = false;
+
+Real PrecipitatorThetaGrid(Real x2, RegionSize rs);
 
 std::int64_t ComputeGlobalX1Offset(const MeshBlock &pmb, int nx1_total) {
   const std::int64_t cell_count = static_cast<std::int64_t>(pmb.block_size.nx1);
@@ -265,6 +268,7 @@ const std::vector<Real> &GetRadiallyAveragedDensity(Mesh *mesh) {
 
 constexpr Real kForceFreeSeriesLimit = 1.0e-6;
 constexpr Real kSqrtTwo = 1.41421356237309504880;
+constexpr Real kInvSqrt4Pi = 0.28209479177387814347;
 constexpr Real kPerturbationWarningThreshold = 1.0e6;
 
 constexpr std::array<Real, 7> kGaussNodes = {
@@ -527,6 +531,13 @@ Real SeriesJ1Derivative(Real x) {
   return 1.0 / 3.0 - x2 / 10.0 + x4 / 280.0;
 }
 
+#if defined(__cpp_lib_math_special_functions)
+inline Real StdSphericalBessel(int l, Real x) {
+  return static_cast<Real>(
+      std::sph_bessel(static_cast<unsigned>(l), static_cast<double>(x)));
+}
+#endif
+
 Real SphericalBesselJ0(Real x) {
   const Real ax = std::abs(x);
   if (ax < kForceFreeSeriesLimit) {
@@ -534,7 +545,11 @@ Real SphericalBesselJ0(Real x) {
     const Real x4 = x2 * x2;
     return 1.0 - x2 / 6.0 + x4 / 120.0;
   }
+#if defined(__cpp_lib_math_special_functions)
+  return StdSphericalBessel(0, x);
+#else
   return std::sin(x) / x;
+#endif
 }
 
 Real SphericalBesselJ1(Real x) {
@@ -542,7 +557,11 @@ Real SphericalBesselJ1(Real x) {
   if (ax < kForceFreeSeriesLimit) {
     return SeriesJ1(x);
   }
+#if defined(__cpp_lib_math_special_functions)
+  return StdSphericalBessel(1, x);
+#else
   return std::sin(x) / (x * x) - std::cos(x) / x;
+#endif
 }
 
 void ForceFreeRadialTerms(Real r, Real *S, Real *S_over_r, Real *dSdr) {
@@ -737,6 +756,66 @@ int PerturbationCoefficientCount() {
   return (g_pert_lmax + 1) * (g_pert_lmax + 2) / 2;
 }
 
+inline std::size_t PerturbationCoeffIndex(int l, int m) {
+  const std::size_t ls = static_cast<std::size_t>(l);
+  const std::size_t ms = static_cast<std::size_t>(m);
+  return ls * (ls + 1u) / 2u + ms;
+}
+
+void ComputeNormalizedAssociatedLegendre(int lmax, Real cos_theta,
+                                         std::vector<Real> &output) {
+  if (lmax < 0) {
+    output.clear();
+    return;
+  }
+  const std::size_t required =
+      static_cast<std::size_t>(lmax + 1) * static_cast<std::size_t>(lmax + 2) / 2;
+  if (output.size() != required) {
+    output.resize(required);
+  }
+
+  const Real sin_theta =
+      std::sqrt(std::max(static_cast<Real>(0.0),
+                         static_cast<Real>(1.0) - cos_theta * cos_theta));
+  output[PerturbationCoeffIndex(0, 0)] = kInvSqrt4Pi;
+
+  Real prev_diag = output[PerturbationCoeffIndex(0, 0)];
+  for (int m = 1; m <= lmax; ++m) {
+    const std::size_t idx = PerturbationCoeffIndex(m, m);
+    const Real factor = -std::sqrt((2.0 * m + 1.0) / (2.0 * m));
+    output[idx] = factor * sin_theta * prev_diag;
+    prev_diag = output[idx];
+  }
+
+  for (int m = 0; m < lmax; ++m) {
+    const std::size_t idx_diag = PerturbationCoeffIndex(m, m);
+    const std::size_t idx_next = PerturbationCoeffIndex(m + 1, m);
+    output[idx_next] = std::sqrt(2.0 * m + 3.0) * cos_theta * output[idx_diag];
+  }
+
+  for (int m = 0; m <= lmax; ++m) {
+    for (int l = m + 2; l <= lmax; ++l) {
+      const Real ll = static_cast<Real>(l);
+      const Real mm = static_cast<Real>(m);
+      const Real denom = ll - mm;
+      const Real term1 = (2.0 * ll - 1.0) / denom;
+      const Real term2 = (ll + mm - 1.0) / denom;
+      const Real ratio1_term = ((2.0 * ll + 1.0) / (2.0 * ll - 1.0)) *
+                               ((ll - mm) / (ll + mm));
+      const Real ratio1 = std::sqrt(std::max(static_cast<Real>(0.0), ratio1_term));
+      const Real ratio2_term = ((2.0 * ll + 1.0) / (2.0 * ll - 3.0)) *
+                               ((ll - mm) * (ll - mm - 1.0)) /
+                               ((ll + mm) * (ll + mm - 1.0));
+      const Real ratio2 = std::sqrt(std::max(static_cast<Real>(0.0), ratio2_term));
+      const std::size_t idx = PerturbationCoeffIndex(l, m);
+      const std::size_t idx_lm1 = PerturbationCoeffIndex(l - 1, m);
+      const std::size_t idx_lm2 = PerturbationCoeffIndex(l - 2, m);
+      output[idx] = term1 * ratio1 * cos_theta * output[idx_lm1] -
+                    term2 * ratio2 * output[idx_lm2];
+    }
+  }
+}
+
 bool PerturbationsActive() {
   return g_enable_density_perturbations && (g_pert_sigma != 0.0) &&
          (g_pert_radial_modes > 0);
@@ -787,21 +866,21 @@ Real SmallXSphericalBessel(int l, Real x) {
 
 Real NoiseSphericalBessel(int l, Real x) {
   const Real ax = std::abs(x);
+  if (ax < g_pert_small_kr_threshold) {
+    return SmallXSphericalBessel(l, x);
+  }
+#if defined(__cpp_lib_math_special_functions)
+  return StdSphericalBessel(l, x);
+#else
   if (l == 0) {
     return SphericalBesselJ0(x);
   }
   if (l == 1) {
     return SphericalBesselJ1(x);
   }
-  if (ax < g_pert_small_kr_threshold) {
-    return SmallXSphericalBessel(l, x);
-  }
   Real jm1 = SphericalBesselJ0(x);
   Real jcurr = SphericalBesselJ1(x);
   for (int ell = 1; ell < l; ++ell) {
-    if (ax < g_pert_small_kr_threshold) {
-      return SmallXSphericalBessel(l, x);
-    }
     const Real jp1 = ((2.0 * ell + 1.0) / x) * jcurr - jm1;
     if (!std::isfinite(jp1) || std::abs(jp1) > 1.0e12) {
       std::cout << "### Warning in precipitator.cpp: spherical Bessel recurrence overflow "
@@ -813,45 +892,7 @@ Real NoiseSphericalBessel(int l, Real x) {
     jcurr = jp1;
   }
   return jcurr;
-}
-
-Real AssociatedLegendre(int l, int m, Real x) {
-  if (m < 0 || m > l) {
-    return 0.0;
-  }
-  Real pmm = 1.0;
-  if (m > 0) {
-    Real arg = 1.0 - x * x;
-    if (arg < 0.0) {
-      arg = 0.0;
-    }
-    Real somx2 = std::sqrt(arg);
-    Real fact = 1.0;
-    for (int i = 1; i <= m; ++i) {
-      pmm *= -fact * somx2;
-      fact += 2.0;
-    }
-  }
-  if (l == m) {
-    return pmm;
-  }
-  Real pmmp1 = x * (2 * m + 1) * pmm;
-  if (l == m + 1) {
-    return pmmp1;
-  }
-  Real pll = 0.0;
-  for (int i = m + 2; i <= l; ++i) {
-    pll = ((2 * i - 1) * x * pmmp1 - (i + m - 1) * pmm) / (i - m);
-    pmm = pmmp1;
-    pmmp1 = pll;
-  }
-  return pll;
-}
-
-Real HarmonicNorm(int l, int m) {
-  const Real ln_ratio = std::lgamma(l - m + 1.0) - std::lgamma(l + m + 1.0);
-  const Real norm_sq = ((2.0 * l + 1.0) / (4.0 * PI)) * std::exp(ln_ratio);
-  return std::sqrt(norm_sq);
+#endif
 }
 
 Real EvalSphHarmNoise(Real r, Real theta, Real phi) {
@@ -861,8 +902,11 @@ Real EvalSphHarmNoise(Real r, Real theta, Real phi) {
   const Real cos_t = std::cos(theta);
   const Real r_scaled = ScaleRadius(r);
   Real noise = 0.0;
-  const int num_coeff = PerturbationCoefficientCount();
+  const std::size_t num_coeff =
+      static_cast<std::size_t>(PerturbationCoefficientCount());
   std::size_t idx_base = 0;
+  static thread_local std::vector<Real> legendre_values;
+  ComputeNormalizedAssociatedLegendre(g_pert_lmax, cos_t, legendre_values);
 
   for (int n = 0; n < g_pert_radial_modes; ++n) {
     std::size_t idx = idx_base;
@@ -880,15 +924,13 @@ Real EvalSphHarmNoise(Real r, Real theta, Real phi) {
                   << ", weight=" << g_pert_radial_weight[n]
                   << ", radial_val=" << radial_val << ")\n";
       }
-      const Real norm0 = HarmonicNorm(l, 0);
-      const Real plm0 = AssociatedLegendre(l, 0, cos_t);
+      const Real plm0 = legendre_values[PerturbationCoeffIndex(l, 0)];
       const Real coeff0 = g_pert_coeff_cos[idx++];
-      noise += coeff0 * level_scale * norm0 * plm0 * radial_val;
+      noise += coeff0 * level_scale * plm0 * radial_val;
 
       for (int m = 1; m <= l; ++m) {
-        const Real norm = HarmonicNorm(l, m);
-        const Real plm = AssociatedLegendre(l, m, cos_t);
-        const Real base = level_scale * norm * plm * radial_val;
+        const Real plm = legendre_values[PerturbationCoeffIndex(l, m)];
+        const Real base = level_scale * plm * radial_val;
         const Real coeff_c = g_pert_coeff_cos[idx];
         const Real coeff_s = g_pert_coeff_sin[idx];
         const Real phase = static_cast<Real>(m) * phi;
@@ -1013,6 +1055,19 @@ void ApplyDensityPerturbations(MeshBlock *pmb) {
   }
 }
 
+//----------------------------------------------------------------------------------------
+// Polar mesh generator (θ-spacing)
+//----------------------------------------------------------------------------------------
+Real PrecipitatorThetaGrid(Real x2, RegionSize rs) {
+  // Logical coordinate centered at zero enables symmetric stretching.
+  const Real t = 2.0 * x2 - 1.0;
+  // Coefficients yield Δθ_pole ≈ 2 Δθ_eq without excessive compression.
+  constexpr Real linear = 0.375;
+  constexpr Real cubic = 0.125;
+  const Real w = 0.5 + linear * t + cubic * t * t * t;
+  return rs.x2min + (rs.x2max - rs.x2min) * w;
+}
+
 } // namespace
 
 // Forward declaration so we can enroll it before the definition appears.
@@ -1029,6 +1084,11 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
   g_gamma = pin->GetReal("hydro", "gamma");
   g_gm1 = g_gamma - 1.0;
   Units *units = punit;
+
+  const Real x2rat = pin->GetOrAddReal("mesh", "x2rat", 1.0);
+  if (x2rat < 0.0) {
+    EnrollUserMeshGenerator(X2DIR, PrecipitatorThetaGrid);
+  }
 
   const std::string profile_filename = pin->GetString("precipitator", "hse_profile_filename");
   g_profile = std::unique_ptr<PrecipitatorProfile>(
@@ -1138,8 +1198,10 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
   g_pert_lmax = pin->GetOrAddInteger("precipitator", "perturbation_lmax", 12);
   g_pert_radial_modes =
       pin->GetOrAddInteger("precipitator", "perturbation_radial_modes", 16);
-  g_pert_kmin = pin->GetOrAddReal("precipitator", "perturbation_kmin", 1.0);
-  g_pert_kmax = pin->GetOrAddReal("precipitator", "perturbation_kmax", 16.0);
+  g_pert_kmin =
+      pin->GetOrAddReal("precipitator", "perturbation_kmin", 0.0);
+  g_pert_kmax =
+      pin->GetOrAddReal("precipitator", "perturbation_kmax", 0.0);
   g_pert_small_kr_threshold =
       pin->GetOrAddReal("precipitator", "perturbation_small_kr_threshold", 1.0);
   const std::string seed_string =
@@ -1350,6 +1412,9 @@ void MeshBlock::InitUserMeshBlockData(ParameterInput *pin) {
 #endif
 
   ++noutputs;  // density contrast output
+#if NON_BAROTROPIC_EOS
+  ++noutputs;  // temperature output
+#endif
 
   if (noutputs == 0) {
     return;
@@ -1364,6 +1429,9 @@ void MeshBlock::InitUserMeshBlockData(ParameterInput *pin) {
   SetUserOutputVariableName(idx++, "divB");
 #endif
   SetUserOutputVariableName(idx++, kDensityContrastName);
+#if NON_BAROTROPIC_EOS
+  SetUserOutputVariableName(idx++, kTemperatureOutputName);
+#endif
 }
 
 //========================================================================================
@@ -1376,6 +1444,7 @@ void MeshBlock::UserWorkBeforeOutput(ParameterInput *pin) {
   }
 
   auto &prim = phydro->w;
+  Units *units = pmy_mesh->punit;
   int next_index = 0;
   const int tcool_index = g_enable_powerlaw_cooling ? next_index++ : -1;
 #if MAGNETIC_FIELDS_ENABLED
@@ -1384,9 +1453,13 @@ void MeshBlock::UserWorkBeforeOutput(ParameterInput *pin) {
   constexpr int divb_index = -1;
 #endif
   const int density_contrast_index = next_index++;
+#if NON_BAROTROPIC_EOS
+  const int temperature_index = next_index++;
+#else
+  constexpr int temperature_index = -1;
+#endif
 
   if (tcool_index >= 0) {
-    Units *units = pmy_mesh->punit;
     if (units == nullptr) {
       std::stringstream msg;
       msg << "### FATAL ERROR in precipitator.cpp" << std::endl
@@ -1486,6 +1559,28 @@ void MeshBlock::UserWorkBeforeOutput(ParameterInput *pin) {
       }
     }
   }
+
+#if NON_BAROTROPIC_EOS
+  if (temperature_index >= 0) {
+    if (units == nullptr) {
+      std::stringstream msg;
+      msg << "### FATAL ERROR in precipitator.cpp" << std::endl
+          << "Units object is not initialized.";
+      ATHENA_ERROR(msg);
+    }
+
+    for (int k = ks; k <= ke; ++k) {
+      for (int j = js; j <= je; ++j) {
+        for (int i = is; i <= ie; ++i) {
+          const Real rho = prim(IDN, k, j, i);
+          const Real pressure = prim(IPR, k, j, i);
+          const Real temperature = ComputeCellTemperature(rho, pressure, *units);
+          user_out_var(temperature_index, k, j, i) = temperature;
+        }
+      }
+    }
+  }
+#endif
 }
 
 //========================================================================================

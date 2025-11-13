@@ -10,9 +10,10 @@ file_type  = hst
 dcycle	   = 1
 
 <output2>
-file_type  = vtk
-variable   = prim,divB,tcool_myr,delta_rho_over_rho_bar
-dcycle	   = 1000
+file_type  = hdf5
+variable   = prim,divB,tcool_myr,delta_rho_over_rho_bar,temperature_K
+cartesian_vector = true
+dcycle	   = 100
 id         = prim
 
 <output3>
@@ -41,6 +42,7 @@ x2min  = 0.0
 x2max  = 3.141592653589793
 ix2_bc = polar
 ox2_bc = polar
+x2rat = -1.0	# use wider theta-spacing near poles to alleviate timestep
 
 nx3    = 64
 x3min  = 0.0
@@ -75,12 +77,11 @@ enable_fourier_bessel_perturbations = 1
 perturbation_sigma = 0.01
 perturbation_lmax = 12
 perturbation_radial_modes = 16
-perturbation_kmin = 1.0
-perturbation_kmax = 32.0
-perturbation_small_kr_threshold = 1.0
+perturbation_kmin = 1.0		# box size
+perturbation_kmax = 16.0	# Nyquist limited: <mesh/nx1> // 2
 perturbation_seed = 88172645463393265
 
 enable_heating = magic
 thermostat_temperature = 1.0e7
 thermostat_Kp = 10.0
-h_smooth_heatcool = 5.0
+h_smooth_heatcool = 10.0

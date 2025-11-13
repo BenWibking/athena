@@ -52,7 +52,38 @@
 # Modules
 import argparse
 import glob
+import os
 import re
+
+
+def _valid_hdf5_prefix(path):
+    """Return True if path looks like an HDF5 install root (contains lib/lib64)."""
+    if not path:
+        return False
+    lib_dirs = ('lib', 'lib64')
+    return any(os.path.isdir(os.path.join(path, lib_dir)) for lib_dir in lib_dirs)
+
+
+def _discover_hdf5_path_from_env():
+    """Infer the HDF5 prefix from common environment variables."""
+    env = os.environ
+    for var in ('HDF5_ROOT', 'HDF5_DIR', 'HDF5_HOME'):
+        candidate = env.get(var, '').strip()
+        if _valid_hdf5_prefix(candidate):
+            return candidate
+    cmake_prefix = env.get('CMAKE_PREFIX_PATH', '')
+    for entry in cmake_prefix.split(os.pathsep):
+        candidate = entry.strip()
+        if candidate and 'hdf5' in candidate.lower() and _valid_hdf5_prefix(candidate):
+            return candidate
+    ld_paths = env.get('LD_LIBRARY_PATH', '') + os.pathsep + env.get('LIBRARY_PATH', '')
+    for entry in ld_paths.split(os.pathsep):
+        lib_dir = entry.strip()
+        if lib_dir and 'hdf5' in lib_dir.lower() and os.path.isdir(lib_dir):
+            prefix = os.path.dirname(lib_dir.rstrip(os.sep))
+            if _valid_hdf5_prefix(prefix):
+                return prefix
+    return ''
 
 
 # Set template and output filenames
@@ -358,6 +389,13 @@ parser.add_argument(
 
 # Parse command-line inputs
 args = vars(parser.parse_args())
+
+# Auto-discover HDF5 path from environment if needed
+if args['hdf5'] and args['hdf5_path'] == '':
+    detected_hdf5 = _discover_hdf5_path_from_env()
+    if detected_hdf5:
+        args['hdf5_path'] = detected_hdf5
+        print('### CONFIGURE NOTICE: Using HDF5 libraries in {0}'.format(detected_hdf5))
 
 # --- Step 2. Test for incompatible arguments ----------------------------
 
