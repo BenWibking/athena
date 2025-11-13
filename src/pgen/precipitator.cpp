@@ -163,6 +163,9 @@ std::vector<Real> g_pert_coeff_sin;
 std::vector<Real> g_pert_k_values;
 std::vector<Real> g_pert_radial_weight;
 
+Real g_inner_sponge_radius = 0.0;
+Real g_inner_sponge_tau = 0.0;
+
 constexpr const char *kDensityContrastName = "delta_rho_over_rho_bar";
 constexpr const char *kTemperatureOutputName = "temperature_K";
 std::vector<Real> g_radial_density_profile;
@@ -171,6 +174,7 @@ int g_radial_density_cycle = -1;
 bool g_radial_density_ready = false;
 
 Real PrecipitatorThetaGrid(Real x2, RegionSize rs);
+void ApplyInnerSponge(MeshBlock *pmb);
 
 std::int64_t ComputeGlobalX1Offset(const MeshBlock &pmb, int nx1_total) {
   const std::int64_t cell_count = static_cast<std::int64_t>(pmb.block_size.nx1);
@@ -331,6 +335,106 @@ Real SampleBackgroundPressureCode(Real radius_code, const Units *units) {
   const Real r_cgs = SampleBackgroundRadiusCgs(radius_code, units);
   const Real pressure_cgs = g_profile->Pressure(r_cgs);
   return pressure_cgs / units->code_pressure_cgs;
+}
+
+void ApplyInnerSponge(MeshBlock *pmb) {
+  if (pmb == nullptr || pmb->phydro == nullptr) {
+    return;
+  }
+  if (!g_profile || g_inner_sponge_tau <= 0.0) {
+    return;
+  }
+  Units *units = pmb->pmy_mesh->punit;
+  if (units == nullptr) {
+    return;
+  }
+  Mesh *mesh = pmb->pmy_mesh;
+  if (mesh == nullptr) {
+    return;
+  }
+  if (mesh->multilevel) {
+    return;
+  }
+  const Real dt = mesh->dt;
+  if (!(dt > 0.0)) {
+    return;
+  }
+
+  const Real r_inner = mesh->mesh_size.x1min;
+  const Real r_limit = g_inner_sponge_radius;
+  if (!(r_limit > r_inner)) {
+    return;
+  }
+  const Real inv_extent = 1.0 / (r_limit - r_inner);
+
+  auto &prim = pmb->phydro->w;
+  auto &cons = pmb->phydro->u;
+  Coordinates *pcoord = pmb->pcoord;
+
+  const int is = pmb->is;
+  const int ie = pmb->ie;
+  const int js = pmb->js;
+  const int je = pmb->je;
+  const int ks = pmb->ks;
+  const int ke = pmb->ke;
+
+  bool modified = false;
+  int damp_hi = is - 1;
+
+  for (int k = ks; k <= ke; ++k) {
+    for (int j = js; j <= je; ++j) {
+      for (int i = is; i <= ie; ++i) {
+        const Real radius_code = pcoord->x1v(i);
+        if (radius_code >= r_limit) {
+          break;
+        }
+        Real radial_weight = (r_limit - radius_code) * inv_extent;
+        radial_weight = std::max(static_cast<Real>(0.0),
+                                 std::min(radial_weight, static_cast<Real>(1.0)));
+        if (radial_weight <= 0.0) {
+          continue;
+        }
+        Real alpha = radial_weight * dt / g_inner_sponge_tau;
+        alpha = std::max(static_cast<Real>(0.0), std::min(alpha, static_cast<Real>(1.0)));
+        if (alpha <= 0.0) {
+          continue;
+        }
+
+        const Real rho_target = SampleBackgroundDensityCode(radius_code, units);
+#if NON_BAROTROPIC_EOS
+        const Real pressure_target = SampleBackgroundPressureCode(radius_code, units);
+#endif
+
+        Real &rho = prim(IDN, k, j, i);
+        rho += alpha * (rho_target - rho);
+
+#if NON_BAROTROPIC_EOS
+        Real &pressure = prim(IPR, k, j, i);
+        pressure += alpha * (pressure_target - pressure);
+#endif
+
+        prim(IVX, k, j, i) *= (1.0 - alpha);
+        prim(IVY, k, j, i) *= (1.0 - alpha);
+        prim(IVZ, k, j, i) *= (1.0 - alpha);
+        modified = true;
+        if (i > damp_hi) {
+          damp_hi = i;
+        }
+      }
+    }
+  }
+
+  if (!modified) {
+    return;
+  }
+
+#if MAGNETIC_FIELDS_ENABLED
+  AthenaArray<Real> &bcc = pmb->pfield->bcc;
+#else
+  AthenaArray<Real> &bcc = prim; // placeholder, bc not used in hydro builds
+#endif
+  pmb->peos->PrimitiveToConserved(prim, bcc, cons, pcoord,
+                                  is, damp_hi, js, je, ks, ke);
 }
 
 Real ComputeCellTemperature(Real rho_code, Real pressure_code, const Units &units) {
@@ -1119,6 +1223,11 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
   const std::string heating_mode =
       pin->GetOrAddString("precipitator", "enable_heating", "none");
   g_enable_magic_heating = (heating_mode == "magic");
+  g_inner_sponge_radius =
+      pin->GetOrAddReal("precipitator", "inner_sponge_radius", mesh_size.x1min);
+  g_inner_sponge_tau =
+      std::max(static_cast<Real>(0.0),
+               pin->GetOrAddReal("precipitator", "inner_sponge_tau", 0.0));
 
   const bool need_powerlaw_coeff =
       g_enable_powerlaw_cooling || g_enable_magic_heating;
@@ -1588,6 +1697,12 @@ void MeshBlock::UserWorkBeforeOutput(ParameterInput *pin) {
 //! \brief Check for non-finite magnetic fields each time step.
 //========================================================================================
 void Mesh::UserWorkInLoop() {
+  if (g_profile && g_inner_sponge_tau > 0.0
+      && g_inner_sponge_radius > mesh_size.x1min) {
+    for (int block = 0; block < nblocal; ++block) {
+      ApplyInnerSponge(my_blocks(block));
+    }
+  }
 #if MAGNETIC_FIELDS_ENABLED
   auto require_finite = [](const char *label, int bid, int k, int j, int i, Real value) {
     if (!std::isfinite(value)) {
