@@ -133,8 +133,8 @@ Real g_magic_mmw_cgs = 0.0;
 Real g_magic_mmw_code = 0.0;
 Real g_magic_c_v = 0.0;
 int g_magic_profile_bins = 0;
-Real g_magic_profile_x3min = 0.0;
-Real g_magic_profile_inv_dz = 0.0;
+Real g_magic_profile_x1min = 0.0;
+Real g_magic_profile_inv_dr = 0.0;
 Real g_magic_profile_time = std::numeric_limits<Real>::quiet_NaN();
 Real g_magic_profile_dt = std::numeric_limits<Real>::quiet_NaN();
 bool g_magic_profile_ready = false;
@@ -381,11 +381,11 @@ void UpdateMagicHeatingProfile(Mesh *mesh, Real time, Real dt) {
   std::vector<Real> sum(static_cast<std::size_t>(num_bins), 0.0);
   std::vector<Real> volume(static_cast<std::size_t>(num_bins), 0.0);
 
-  const Real x3min = mesh->mesh_size.x3min;
-  const Real x3max = mesh->mesh_size.x3max;
-  const Real extent = x3max - x3min;
+  const Real x1min = mesh->mesh_size.x1min;
+  const Real x1max = mesh->mesh_size.x1max;
+  const Real extent = x1max - x1min;
   const bool has_extent = (num_bins > 1) && (extent > 0.0);
-  const Real inv_dz = has_extent ? static_cast<Real>(num_bins) / extent : 0.0;
+  const Real inv_dr = has_extent ? static_cast<Real>(num_bins) / extent : 0.0;
 
   for (int block = 0; block < mesh->nblocal; ++block) {
     MeshBlock *pmb = mesh->my_blocks(block);
@@ -395,16 +395,16 @@ void UpdateMagicHeatingProfile(Mesh *mesh, Real time, Real dt) {
     auto &prim = pmb->phydro->w;
     Coordinates *coord = pmb->pcoord;
     for (int k = pmb->ks; k <= pmb->ke; ++k) {
-      const Real z = coord->x3v(k);
-      int idx = has_extent ? static_cast<int>((z - x3min) * inv_dz) : 0;
-      if (idx < 0) {
-        idx = 0;
-      }
-      if (idx >= num_bins) {
-        idx = num_bins - 1;
-      }
       for (int j = pmb->js; j <= pmb->je; ++j) {
         for (int i = pmb->is; i <= pmb->ie; ++i) {
+          const Real r = coord->x1v(i);
+          int idx = has_extent ? static_cast<int>((r - x1min) * inv_dr) : 0;
+          if (idx < 0) {
+            idx = 0;
+          }
+          if (idx >= num_bins) {
+            idx = num_bins - 1;
+          }
           const Real rho = prim(IDN, k, j, i);
           const Real pressure = prim(IPR, k, j, i);
           const Real temperature = ComputeCellTemperature(rho, pressure, *units);
@@ -436,18 +436,18 @@ void UpdateMagicHeatingProfile(Mesh *mesh, Real time, Real dt) {
   g_magic_profile_ready = true;
   g_magic_profile_time = time;
   g_magic_profile_dt = dt;
-  g_magic_profile_x3min = x3min;
-  g_magic_profile_inv_dz = has_extent ? inv_dz : 0.0;
+  g_magic_profile_x1min = x1min;
+  g_magic_profile_inv_dr = has_extent ? inv_dr : 0.0;
 }
 
 Real SampleMagicHeatingError(Real coord_value) {
   if (!g_magic_profile_ready || g_magic_error_profile.empty()) {
     return 0.0;
   }
-  if (g_magic_profile_bins <= 1 || g_magic_profile_inv_dz == 0.0) {
+  if (g_magic_profile_bins <= 1 || g_magic_profile_inv_dr == 0.0) {
     return g_magic_error_profile.front();
   }
-  Real idx_f = (coord_value - g_magic_profile_x3min) * g_magic_profile_inv_dz;
+  Real idx_f = (coord_value - g_magic_profile_x1min) * g_magic_profile_inv_dr;
   if (idx_f <= 0.0) {
     return g_magic_error_profile.front();
   }
@@ -1175,13 +1175,13 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
     g_magic_mmw_cgs = g_magic_mu * Constants::hydrogen_mass_cgs;
     g_magic_mmw_code = g_magic_mmw_cgs * units->gram_code;
     g_magic_c_v = (units->k_boltzmann_code / g_magic_mmw_code) / g_gm1;
-    g_magic_profile_bins = mesh_size.nx3;
+    g_magic_profile_bins = mesh_size.nx1;
     g_magic_error_profile.assign(static_cast<std::size_t>(g_magic_profile_bins), 0.0);
     g_magic_profile_ready = false;
     g_magic_profile_time = std::numeric_limits<Real>::quiet_NaN();
     g_magic_profile_dt = std::numeric_limits<Real>::quiet_NaN();
-    g_magic_profile_x3min = mesh_size.x3min;
-    g_magic_profile_inv_dz = 0.0;
+    g_magic_profile_x1min = mesh_size.x1min;
+    g_magic_profile_inv_dr = 0.0;
   } else {
     g_magic_error_profile.clear();
     g_magic_profile_bins = 0;
@@ -1730,10 +1730,9 @@ void PrecipitatorGravity(MeshBlock *pmb, const Real time, const Real dt,
         }
 
         if (heating_enabled && g_magic_profile_ready) {
-          const Real z = pcoord->x3v(k);
-          const Real err = SampleMagicHeatingError(z);
+          const Real radius_code = pcoord->x1v(i);
+          const Real err = SampleMagicHeatingError(radius_code);
           if (err != 0.0) {
-            const Real radius_code = pcoord->x1v(i);
             const Real taper = MagicHeatingTaper(radius_code);
             if (taper > 0.0) {
               const Real rho_bg = SampleBackgroundDensityCode(radius_code, units);

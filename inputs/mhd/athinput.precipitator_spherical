@@ -27,33 +27,33 @@ cfl_number = 0.2
 nlim       = 500000
 tlim       = 1.0e3
 integrator = rk2
-xorder 	   = 2m
+xorder 	   = 3c
 ncycle_out = 1
 
 <mesh>
-nx1    = 64
+nx1    = 32
 x1min  = 1.0
 x1max  = 100.0
 ix1_bc = reflecting
 ox1_bc = reflecting
 
-nx2    = 64
+nx2    = 32
 x2min  = 0.0
 x2max  = 3.141592653589793
 ix2_bc = polar
 ox2_bc = polar
 x2rat = -1.0	# use wider theta-spacing near poles to alleviate timestep
 
-nx3    = 64
+nx3    = 32
 x3min  = 0.0
 x3max  = 6.2831853071795862
 ix3_bc = periodic
 ox3_bc = periodic
 
 <meshblock>
-nx1 = 32
-nx2 = 32
-nx3 = 32
+nx1 = 16
+nx2 = 16
+nx3 = 16
 
 <hydro>
 gamma = 1.6666666666666667
