@@ -33,7 +33,8 @@
 4. **Diagnostics & Output Hooks**
    - Port the radial-profile reductions (`ComputeAvgProfile1D`, `VerticalMeanProfiles`) and derived field fills done before output (`../athenapk/src/pgen/precipitator.cpp:650-828`).
    - Utilize `MeshBlock::UserWorkBeforeOutput` and possibly `Mesh::AllocateUserHistoryOutput` (see `src/mesh/mesh.cpp:1508-1523`) to store derived quantities and history channels.
-   - Ensure turbulence heating rates, Mach numbers, delta fields, etc., show up in outputs analogous to AthenaPK’s metadata fields.
+   - Gravitation potential, hydrostatic pressure, entropy/temperature deltas, Mach, and velocity-dispersion diagnostics now populate via the new radial-profile helpers; only the turbulent-heating rates remain outstanding.
+   - Only the turbulent-heating history needs persistent storage between source applications and diagnostics; all other derived fields recompute their radial profiles on demand within `UserWorkBeforeOutput`.
 
 5. **Cooling & Heating Integration**
    - AthenaPK’s precipitator setup couples the “magic heating” controller to a power-law cooling approximation (Λ ∝ n²).

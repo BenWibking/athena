@@ -169,12 +169,19 @@ Real g_inner_sponge_tau = 0.0;
 constexpr const char *kDensityContrastName = "delta_rho_over_rho_bar";
 constexpr const char *kTemperatureOutputName = "temperature_K";
 std::vector<Real> g_radial_density_profile;
+std::vector<Real> g_radial_pressure_profile;
+std::vector<Real> g_radial_entropy_profile;
+std::vector<Real> g_radial_temperature_profile;
+std::vector<Real> g_radial_v1_profile;
+std::vector<Real> g_radial_v2_profile;
+std::vector<Real> g_radial_v3_profile;
 Real g_radial_density_time = std::numeric_limits<Real>::quiet_NaN();
 int g_radial_density_cycle = -1;
 bool g_radial_density_ready = false;
 
 Real PrecipitatorThetaGrid(Real x2, RegionSize rs);
 void ApplyInnerSponge(MeshBlock *pmb);
+Real ComputeCellTemperature(Real rho_code, Real pressure_code, const Units &units);
 
 std::int64_t ComputeGlobalX1Offset(const MeshBlock &pmb, int nx1_total) {
   const std::int64_t cell_count = static_cast<std::int64_t>(pmb.block_size.nx1);
@@ -189,7 +196,7 @@ std::int64_t ComputeGlobalX1Offset(const MeshBlock &pmb, int nx1_total) {
   return base_index;
 }
 
-void ComputeRadiallyAveragedDensity(Mesh *mesh) {
+void ComputeRadialProfiles(Mesh *mesh) {
   if (mesh == nullptr) {
     return;
   }
@@ -203,12 +210,39 @@ void ComputeRadiallyAveragedDensity(Mesh *mesh) {
   const int nx1_total = mesh->mesh_size.nx1;
   if (nx1_total <= 0) {
     g_radial_density_profile.clear();
+    g_radial_pressure_profile.clear();
+    g_radial_entropy_profile.clear();
+    g_radial_temperature_profile.clear();
+    g_radial_v1_profile.clear();
+    g_radial_v2_profile.clear();
+    g_radial_v3_profile.clear();
     g_radial_density_ready = false;
     return;
   }
 
-  std::vector<Real> rho_sum(static_cast<std::size_t>(nx1_total), 0.0);
-  std::vector<Real> volume(static_cast<std::size_t>(nx1_total), 0.0);
+  Units *units = mesh->punit;
+#if NON_BAROTROPIC_EOS
+  if (units == nullptr) {
+    std::stringstream msg;
+    msg << "### FATAL ERROR in precipitator.cpp" << std::endl
+        << "Units object must be configured before computing diagnostic profiles.";
+    ATHENA_ERROR(msg);
+  }
+#else
+  (void)units;
+#endif
+
+  const std::size_t vec_size = static_cast<std::size_t>(nx1_total);
+  std::vector<Real> rho_sum(vec_size, 0.0);
+#if NON_BAROTROPIC_EOS
+  std::vector<Real> pressure_sum(vec_size, 0.0);
+  std::vector<Real> entropy_sum(vec_size, 0.0);
+  std::vector<Real> temperature_sum(vec_size, 0.0);
+#endif
+  std::vector<Real> v1_sum(vec_size, 0.0);
+  std::vector<Real> v2_sum(vec_size, 0.0);
+  std::vector<Real> v3_sum(vec_size, 0.0);
+  std::vector<Real> volume(vec_size, 0.0);
 
   for (int block = 0; block < mesh->nblocal; ++block) {
     MeshBlock *pmb = mesh->my_blocks(block);
@@ -228,6 +262,23 @@ void ComputeRadiallyAveragedDensity(Mesh *mesh) {
           const Real cell_volume = coord->GetCellVolume(k, j, i);
           const Real rho = prim(IDN, k, j, i);
           rho_sum[idx] += rho * cell_volume;
+#if NON_BAROTROPIC_EOS
+          const Real pressure = prim(IPR, k, j, i);
+          pressure_sum[idx] += pressure * cell_volume;
+          Real entropy = 0.0;
+          if (pressure > 0.0 && rho > 0.0) {
+            entropy = pressure / std::pow(rho, g_gamma);
+          }
+          entropy_sum[idx] += entropy * cell_volume;
+          const Real temperature = ComputeCellTemperature(rho, pressure, *units);
+          temperature_sum[idx] += temperature * cell_volume;
+#endif
+          const Real v1 = prim(IVX, k, j, i);
+          const Real v2 = prim(IVY, k, j, i);
+          const Real v3 = prim(IVZ, k, j, i);
+          v1_sum[idx] += v1 * cell_volume;
+          v2_sum[idx] += v2 * cell_volume;
+          v3_sum[idx] += v3 * cell_volume;
           volume[idx] += cell_volume;
         }
       }
@@ -237,17 +288,56 @@ void ComputeRadiallyAveragedDensity(Mesh *mesh) {
 #ifdef MPI_PARALLEL
   MPI_Allreduce(MPI_IN_PLACE, rho_sum.data(), nx1_total, MPI_ATHENA_REAL, MPI_SUM,
                 MPI_COMM_WORLD);
+#if NON_BAROTROPIC_EOS
+  MPI_Allreduce(MPI_IN_PLACE, pressure_sum.data(), nx1_total, MPI_ATHENA_REAL, MPI_SUM,
+                MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE, entropy_sum.data(), nx1_total, MPI_ATHENA_REAL, MPI_SUM,
+                MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE, temperature_sum.data(), nx1_total, MPI_ATHENA_REAL,
+                MPI_SUM, MPI_COMM_WORLD);
+#endif
+  MPI_Allreduce(MPI_IN_PLACE, v1_sum.data(), nx1_total, MPI_ATHENA_REAL, MPI_SUM,
+                MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE, v2_sum.data(), nx1_total, MPI_ATHENA_REAL, MPI_SUM,
+                MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE, v3_sum.data(), nx1_total, MPI_ATHENA_REAL, MPI_SUM,
+                MPI_COMM_WORLD);
   MPI_Allreduce(MPI_IN_PLACE, volume.data(), nx1_total, MPI_ATHENA_REAL, MPI_SUM,
                 MPI_COMM_WORLD);
 #endif
 
-  g_radial_density_profile.assign(static_cast<std::size_t>(nx1_total), 0.0);
+  g_radial_density_profile.assign(vec_size, 0.0);
+#if NON_BAROTROPIC_EOS
+  g_radial_pressure_profile.assign(vec_size, 0.0);
+  g_radial_entropy_profile.assign(vec_size, 0.0);
+  g_radial_temperature_profile.assign(vec_size, 0.0);
+#endif
+  g_radial_v1_profile.assign(vec_size, 0.0);
+  g_radial_v2_profile.assign(vec_size, 0.0);
+  g_radial_v3_profile.assign(vec_size, 0.0);
+
   for (int i = 0; i < nx1_total; ++i) {
     const std::size_t idx = static_cast<std::size_t>(i);
     if (volume[idx] > 0.0) {
       g_radial_density_profile[idx] = rho_sum[idx] / volume[idx];
+#if NON_BAROTROPIC_EOS
+      g_radial_pressure_profile[idx] = pressure_sum[idx] / volume[idx];
+      g_radial_entropy_profile[idx] = entropy_sum[idx] / volume[idx];
+      g_radial_temperature_profile[idx] = temperature_sum[idx] / volume[idx];
+#endif
+      g_radial_v1_profile[idx] = v1_sum[idx] / volume[idx];
+      g_radial_v2_profile[idx] = v2_sum[idx] / volume[idx];
+      g_radial_v3_profile[idx] = v3_sum[idx] / volume[idx];
     } else {
       g_radial_density_profile[idx] = 0.0;
+#if NON_BAROTROPIC_EOS
+      g_radial_pressure_profile[idx] = 0.0;
+      g_radial_entropy_profile[idx] = 0.0;
+      g_radial_temperature_profile[idx] = 0.0;
+#endif
+      g_radial_v1_profile[idx] = 0.0;
+      g_radial_v2_profile[idx] = 0.0;
+      g_radial_v3_profile[idx] = 0.0;
     }
   }
 
@@ -265,9 +355,95 @@ const std::vector<Real> &GetRadiallyAveragedDensity(Mesh *mesh) {
       static_cast<int>(g_radial_density_profile.size()) != mesh->mesh_size.nx1;
   if (!g_radial_density_ready || size_changed || g_radial_density_cycle != mesh->ncycle
       || g_radial_density_time != mesh->time) {
-    ComputeRadiallyAveragedDensity(mesh);
+    ComputeRadialProfiles(mesh);
   }
   return g_radial_density_profile;
+}
+
+#if NON_BAROTROPIC_EOS
+const std::vector<Real> &GetRadiallyAveragedPressure(Mesh *mesh) {
+  static const std::vector<Real> kEmptyProfile;
+  if (mesh == nullptr) {
+    return kEmptyProfile;
+  }
+  const bool size_changed =
+      static_cast<int>(g_radial_pressure_profile.size()) != mesh->mesh_size.nx1;
+  if (!g_radial_density_ready || size_changed || g_radial_density_cycle != mesh->ncycle
+      || g_radial_density_time != mesh->time) {
+    ComputeRadialProfiles(mesh);
+  }
+  return g_radial_pressure_profile;
+}
+
+const std::vector<Real> &GetRadiallyAveragedEntropy(Mesh *mesh) {
+  static const std::vector<Real> kEmptyProfile;
+  if (mesh == nullptr) {
+    return kEmptyProfile;
+  }
+  const bool size_changed =
+      static_cast<int>(g_radial_entropy_profile.size()) != mesh->mesh_size.nx1;
+  if (!g_radial_density_ready || size_changed || g_radial_density_cycle != mesh->ncycle
+      || g_radial_density_time != mesh->time) {
+    ComputeRadialProfiles(mesh);
+  }
+  return g_radial_entropy_profile;
+}
+
+const std::vector<Real> &GetRadiallyAveragedTemperature(Mesh *mesh) {
+  static const std::vector<Real> kEmptyProfile;
+  if (mesh == nullptr) {
+    return kEmptyProfile;
+  }
+  const bool size_changed =
+      static_cast<int>(g_radial_temperature_profile.size()) != mesh->mesh_size.nx1;
+  if (!g_radial_density_ready || size_changed || g_radial_density_cycle != mesh->ncycle
+      || g_radial_density_time != mesh->time) {
+    ComputeRadialProfiles(mesh);
+  }
+  return g_radial_temperature_profile;
+}
+#endif
+
+const std::vector<Real> &GetRadiallyAveragedV1(Mesh *mesh) {
+  static const std::vector<Real> kEmptyProfile;
+  if (mesh == nullptr) {
+    return kEmptyProfile;
+  }
+  const bool size_changed =
+      static_cast<int>(g_radial_v1_profile.size()) != mesh->mesh_size.nx1;
+  if (!g_radial_density_ready || size_changed || g_radial_density_cycle != mesh->ncycle
+      || g_radial_density_time != mesh->time) {
+    ComputeRadialProfiles(mesh);
+  }
+  return g_radial_v1_profile;
+}
+
+const std::vector<Real> &GetRadiallyAveragedV2(Mesh *mesh) {
+  static const std::vector<Real> kEmptyProfile;
+  if (mesh == nullptr) {
+    return kEmptyProfile;
+  }
+  const bool size_changed =
+      static_cast<int>(g_radial_v2_profile.size()) != mesh->mesh_size.nx1;
+  if (!g_radial_density_ready || size_changed || g_radial_density_cycle != mesh->ncycle
+      || g_radial_density_time != mesh->time) {
+    ComputeRadialProfiles(mesh);
+  }
+  return g_radial_v2_profile;
+}
+
+const std::vector<Real> &GetRadiallyAveragedV3(Mesh *mesh) {
+  static const std::vector<Real> kEmptyProfile;
+  if (mesh == nullptr) {
+    return kEmptyProfile;
+  }
+  const bool size_changed =
+      static_cast<int>(g_radial_v3_profile.size()) != mesh->mesh_size.nx1;
+  if (!g_radial_density_ready || size_changed || g_radial_density_cycle != mesh->ncycle
+      || g_radial_density_time != mesh->time) {
+    ComputeRadialProfiles(mesh);
+  }
+  return g_radial_v3_profile;
 }
 
 constexpr Real kForceFreeSeriesLimit = 1.0e-6;
@@ -1217,6 +1393,8 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
 
   const Real He_mass_fraction = pin->GetOrAddReal("hydro", "He_mass_fraction", 0.25);
   const Real hydrogen_mass_fraction = 1.0 - He_mass_fraction;
+  g_magic_mu = 1.0 / (He_mass_fraction * 0.75 + hydrogen_mass_fraction * 2.0);
+  g_magic_mmw_cgs = g_magic_mu * Constants::hydrogen_mass_cgs;
 
   g_enable_powerlaw_cooling =
       (pin->GetOrAddInteger("precipitator", "enable_powerlaw_cooling", 0) != 0);
@@ -1280,8 +1458,6 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
     if (g_magic_h_smooth <= 0.0) {
       g_magic_h_smooth = 1.0;
     }
-    g_magic_mu = 1.0 / (He_mass_fraction * 0.75 + hydrogen_mass_fraction * 2.0);
-    g_magic_mmw_cgs = g_magic_mu * Constants::hydrogen_mass_cgs;
     g_magic_mmw_code = g_magic_mmw_cgs * units->gram_code;
     g_magic_c_v = (units->k_boltzmann_code / g_magic_mmw_code) / g_gm1;
     g_magic_profile_bins = mesh_size.nx1;
@@ -1525,6 +1701,23 @@ void MeshBlock::InitUserMeshBlockData(ParameterInput *pin) {
   ++noutputs;  // temperature output
 #endif
 
+  ++noutputs;  // gravitational potential
+  ++noutputs;  // hydrostatic pressure reference
+#if NON_BAROTROPIC_EOS
+  ++noutputs;  // entropy
+  ++noutputs;  // delta pressure
+  ++noutputs;  // delta entropy
+  ++noutputs;  // delta temperature
+#endif
+
+  noutputs += 3;  // dv components
+#if NON_BAROTROPIC_EOS
+  ++noutputs;  // Mach number
+#endif
+#if MAGNETIC_FIELDS_ENABLED
+  ++noutputs;  // plasma beta
+#endif
+
   if (noutputs == 0) {
     return;
   }
@@ -1541,6 +1734,23 @@ void MeshBlock::InitUserMeshBlockData(ParameterInput *pin) {
 #if NON_BAROTROPIC_EOS
   SetUserOutputVariableName(idx++, kTemperatureOutputName);
 #endif
+  SetUserOutputVariableName(idx++, "grav_phi");
+  SetUserOutputVariableName(idx++, "pressure_hse");
+#if NON_BAROTROPIC_EOS
+  SetUserOutputVariableName(idx++, "entropy_K");
+  SetUserOutputVariableName(idx++, "delta_pressure_over_pressure_bar");
+  SetUserOutputVariableName(idx++, "delta_entropy_over_entropy_bar");
+  SetUserOutputVariableName(idx++, "delta_temperature_over_temperature_bar");
+#endif
+  SetUserOutputVariableName(idx++, "dv1_kms");
+  SetUserOutputVariableName(idx++, "dv2_kms");
+  SetUserOutputVariableName(idx++, "dv3_kms");
+#if NON_BAROTROPIC_EOS
+  SetUserOutputVariableName(idx++, "mach_sonic");
+#endif
+#if MAGNETIC_FIELDS_ENABLED
+  SetUserOutputVariableName(idx++, "plasma_beta");
+#endif
 }
 
 //========================================================================================
@@ -1554,6 +1764,13 @@ void MeshBlock::UserWorkBeforeOutput(ParameterInput *pin) {
 
   auto &prim = phydro->w;
   Units *units = pmy_mesh->punit;
+  if (units == nullptr) {
+    std::stringstream msg;
+    msg << "### FATAL ERROR in precipitator.cpp" << std::endl
+        << "Units object is not initialized.";
+    ATHENA_ERROR(msg);
+  }
+  Mesh *mesh = pmy_mesh;
   int next_index = 0;
   const int tcool_index = g_enable_powerlaw_cooling ? next_index++ : -1;
 #if MAGNETIC_FIELDS_ENABLED
@@ -1567,24 +1784,108 @@ void MeshBlock::UserWorkBeforeOutput(ParameterInput *pin) {
 #else
   constexpr int temperature_index = -1;
 #endif
+  const int grav_phi_index = next_index++;
+  const int pressure_hse_index = next_index++;
+#if NON_BAROTROPIC_EOS
+  const int entropy_index = next_index++;
+  const int delta_pressure_index = next_index++;
+  const int delta_entropy_index = next_index++;
+  const int delta_temperature_index = next_index++;
+#else
+  constexpr int entropy_index = -1;
+  constexpr int delta_pressure_index = -1;
+  constexpr int delta_entropy_index = -1;
+  constexpr int delta_temperature_index = -1;
+#endif
+  const int dv1_index = next_index++;
+  const int dv2_index = next_index++;
+  const int dv3_index = next_index++;
+#if NON_BAROTROPIC_EOS
+  const int mach_index = next_index++;
+#else
+  constexpr int mach_index = -1;
+#endif
+#if MAGNETIC_FIELDS_ENABLED
+  const int plasma_beta_index = next_index++;
+#else
+  constexpr int plasma_beta_index = -1;
+#endif
 
-  if (tcool_index >= 0) {
-    if (units == nullptr) {
-      std::stringstream msg;
-      msg << "### FATAL ERROR in precipitator.cpp" << std::endl
-          << "Units object is not initialized.";
-      ATHENA_ERROR(msg);
-    }
+  const std::vector<Real> &rho_bar = GetRadiallyAveragedDensity(mesh);
+  const bool has_profile =
+      (mesh != nullptr) && (mesh->mesh_size.nx1 > 0)
+      && (rho_bar.size() == static_cast<std::size_t>(mesh->mesh_size.nx1));
+  std::int64_t base_index = 0;
+  if (has_profile) {
+    base_index = ComputeGlobalX1Offset(*this, mesh->mesh_size.nx1);
+  }
 
-    const Real gm1 = g_gm1;
-    const Real million_yr_code = units->million_yr_code;
-    const Real lambda = g_powerlaw_lambda_code;
+#if NON_BAROTROPIC_EOS
+  const std::vector<Real> &pressure_bar = GetRadiallyAveragedPressure(mesh);
+  const std::vector<Real> &entropy_bar = GetRadiallyAveragedEntropy(mesh);
+  const std::vector<Real> &temperature_bar = GetRadiallyAveragedTemperature(mesh);
+#endif
+  const std::vector<Real> &v1_bar = GetRadiallyAveragedV1(mesh);
+  const std::vector<Real> &v2_bar = GetRadiallyAveragedV2(mesh);
+  const std::vector<Real> &v3_bar = GetRadiallyAveragedV3(mesh);
 
-    for (int k = ks; k <= ke; ++k) {
-      for (int j = js; j <= je; ++j) {
-        for (int i = is; i <= ie; ++i) {
-          const Real rho = prim(IDN, k, j, i);
-          const Real pressure = prim(IPR, k, j, i);
+#if NON_BAROTROPIC_EOS
+  const Real gm1 = g_gm1;
+  const Real gamma = g_gamma;
+  const Real million_yr_code = units->million_yr_code;
+  const Real lambda = g_powerlaw_lambda_code;
+#endif
+  const Real velocity_to_kms =
+      (units->code_length_cgs / units->code_time_cgs) * 1.0e-5;
+
+  for (int k = ks; k <= ke; ++k) {
+    for (int j = js; j <= je; ++j) {
+      for (int i = is; i <= ie; ++i) {
+        const Real rho = prim(IDN, k, j, i);
+        const Real v1 = prim(IVX, k, j, i);
+        const Real v2 = prim(IVY, k, j, i);
+        const Real v3 = prim(IVZ, k, j, i);
+        const Real radius_code = pcoord->x1v(i);
+        Real rho_avg = 0.0;
+        Real v1_avg = 0.0;
+        Real v2_avg = 0.0;
+        Real v3_avg = 0.0;
+#if NON_BAROTROPIC_EOS
+        Real pressure_avg = 0.0;
+        Real entropy_avg = 0.0;
+        Real temperature_avg = 0.0;
+#endif
+        bool have_bg = false;
+        if (has_profile) {
+          const std::int64_t global_i = base_index + static_cast<std::int64_t>(i - is);
+          const std::size_t bg_idx = static_cast<std::size_t>(global_i);
+          if (bg_idx < rho_bar.size()) {
+            rho_avg = rho_bar[bg_idx];
+            have_bg = true;
+          }
+          if (bg_idx < v1_bar.size()) {
+            v1_avg = v1_bar[bg_idx];
+            v2_avg = v2_bar[bg_idx];
+            v3_avg = v3_bar[bg_idx];
+          }
+#if NON_BAROTROPIC_EOS
+          if (bg_idx < pressure_bar.size()) {
+            pressure_avg = pressure_bar[bg_idx];
+            entropy_avg = entropy_bar[bg_idx];
+            temperature_avg = temperature_bar[bg_idx];
+          }
+#endif
+        }
+
+#if NON_BAROTROPIC_EOS
+        const Real pressure = prim(IPR, k, j, i);
+        Real entropy = 0.0;
+        if (pressure > 0.0 && rho > 0.0) {
+          entropy = pressure / std::pow(rho, gamma);
+        }
+        const Real temperature = ComputeCellTemperature(rho, pressure, *units);
+
+        if (tcool_index >= 0) {
           Real tcool_myr = std::numeric_limits<Real>::infinity();
           if (rho > 0.0 && pressure > 0.0 && lambda > 0.0 && million_yr_code > 0.0) {
             const Real eint = pressure / gm1;
@@ -1596,6 +1897,96 @@ void MeshBlock::UserWorkBeforeOutput(ParameterInput *pin) {
           }
           user_out_var(tcool_index, k, j, i) = tcool_myr;
         }
+#endif
+
+        if (density_contrast_index >= 0) {
+          Real contrast = 0.0;
+          if (have_bg && rho_avg > 0.0) {
+            contrast = (rho - rho_avg) / rho_avg;
+          }
+          user_out_var(density_contrast_index, k, j, i) = contrast;
+        }
+
+#if NON_BAROTROPIC_EOS
+        if (temperature_index >= 0) {
+          user_out_var(temperature_index, k, j, i) = temperature;
+        }
+        if (entropy_index >= 0) {
+          user_out_var(entropy_index, k, j, i) = entropy;
+        }
+        if (delta_pressure_index >= 0) {
+          Real delta = 0.0;
+          if (have_bg && pressure_avg > 0.0) {
+            delta = (pressure - pressure_avg) / pressure_avg;
+          }
+          user_out_var(delta_pressure_index, k, j, i) = delta;
+        }
+        if (delta_entropy_index >= 0) {
+          Real delta = 0.0;
+          if (have_bg && entropy_avg > 0.0) {
+            delta = (entropy - entropy_avg) / entropy_avg;
+          }
+          user_out_var(delta_entropy_index, k, j, i) = delta;
+        }
+        if (delta_temperature_index >= 0) {
+          Real delta = 0.0;
+          if (have_bg && temperature_avg != 0.0) {
+            delta = (temperature - temperature_avg) / temperature_avg;
+          }
+          user_out_var(delta_temperature_index, k, j, i) = delta;
+        }
+#endif
+
+        if (grav_phi_index >= 0) {
+          user_out_var(grav_phi_index, k, j, i) =
+              PotentialInCodeUnits(radius_code, units);
+        }
+        if (pressure_hse_index >= 0) {
+          user_out_var(pressure_hse_index, k, j, i) =
+              SampleBackgroundPressureCode(radius_code, units);
+        }
+
+        const Real dv1 = have_bg ? (v1 - v1_avg) : 0.0;
+        const Real dv2 = have_bg ? (v2 - v2_avg) : 0.0;
+        const Real dv3 = have_bg ? (v3 - v3_avg) : 0.0;
+        if (dv1_index >= 0) {
+          user_out_var(dv1_index, k, j, i) = dv1 * velocity_to_kms;
+        }
+        if (dv2_index >= 0) {
+          user_out_var(dv2_index, k, j, i) = dv2 * velocity_to_kms;
+        }
+        if (dv3_index >= 0) {
+          user_out_var(dv3_index, k, j, i) = dv3 * velocity_to_kms;
+        }
+
+#if NON_BAROTROPIC_EOS
+        if (mach_index >= 0) {
+          Real mach = 0.0;
+          if (rho > 0.0 && pressure > 0.0) {
+            const Real sound_speed = std::sqrt(gamma * pressure / rho);
+            if (sound_speed > 0.0) {
+              const Real dv_mag = std::sqrt(SQR(dv1) + SQR(dv2) + SQR(dv3));
+              mach = dv_mag / sound_speed;
+            }
+          }
+          user_out_var(mach_index, k, j, i) = mach;
+        }
+#endif
+
+#if MAGNETIC_FIELDS_ENABLED && NON_BAROTROPIC_EOS
+        if (plasma_beta_index >= 0) {
+          const Real b1 = pfield->bcc(IB1, k, j, i);
+          const Real b2 = pfield->bcc(IB2, k, j, i);
+          const Real b3 = pfield->bcc(IB3, k, j, i);
+          const Real mag_pressure = 0.5 * (SQR(b1) + SQR(b2) + SQR(b3));
+          Real beta = std::numeric_limits<Real>::infinity();
+          if (mag_pressure > 0.0) {
+            const Real pressure = prim(IPR, k, j, i);
+            beta = pressure / mag_pressure;
+          }
+          user_out_var(plasma_beta_index, k, j, i) = beta;
+        }
+#endif
       }
     }
   }
@@ -1635,56 +2026,6 @@ void MeshBlock::UserWorkBeforeOutput(ParameterInput *pin) {
             divb = (flux_x1 + flux_x2 + flux_x3) / cell_vol;
           }
           user_out_var(divb_index, k, j, i) = divb;
-        }
-      }
-    }
-  }
-#endif
-
-  if (density_contrast_index >= 0) {
-    Mesh *mesh = pmy_mesh;
-    const std::vector<Real> &rho_bar = GetRadiallyAveragedDensity(mesh);
-    const bool has_profile =
-        (mesh != nullptr) && (mesh->mesh_size.nx1 > 0)
-        && (rho_bar.size() == static_cast<std::size_t>(mesh->mesh_size.nx1));
-    std::int64_t base_index = 0;
-    if (has_profile) {
-      base_index = ComputeGlobalX1Offset(*this, mesh->mesh_size.nx1);
-    }
-
-    for (int k = ks; k <= ke; ++k) {
-      for (int j = js; j <= je; ++j) {
-        for (int i = is; i <= ie; ++i) {
-          Real contrast = 0.0;
-          if (has_profile) {
-            const std::int64_t global_i = base_index + static_cast<std::int64_t>(i - is);
-            const Real rho_avg = rho_bar[static_cast<std::size_t>(global_i)];
-            if (rho_avg > 0.0) {
-              contrast = (prim(IDN, k, j, i) - rho_avg) / rho_avg;
-            }
-          }
-          user_out_var(density_contrast_index, k, j, i) = contrast;
-        }
-      }
-    }
-  }
-
-#if NON_BAROTROPIC_EOS
-  if (temperature_index >= 0) {
-    if (units == nullptr) {
-      std::stringstream msg;
-      msg << "### FATAL ERROR in precipitator.cpp" << std::endl
-          << "Units object is not initialized.";
-      ATHENA_ERROR(msg);
-    }
-
-    for (int k = ks; k <= ke; ++k) {
-      for (int j = js; j <= je; ++j) {
-        for (int i = is; i <= ie; ++i) {
-          const Real rho = prim(IDN, k, j, i);
-          const Real pressure = prim(IPR, k, j, i);
-          const Real temperature = ComputeCellTemperature(rho, pressure, *units);
-          user_out_var(temperature_index, k, j, i) = temperature;
         }
       }
     }
