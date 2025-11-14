@@ -144,6 +144,8 @@ std::string g_force_free_param_file;
 bool g_force_free_loaded = false;
 Real g_force_free_alpha = 0.0;
 Real g_force_free_amplitude = 1.0;
+bool g_force_free_amplitude_override = false;
+Real g_force_free_amplitude_override_value = 1.0;
 
 bool g_enable_density_perturbations = false;
 Real g_pert_sigma = 0.0;
@@ -783,8 +785,6 @@ void LoadForceFreeParameters() {
     if (key == "alpha") {
       g_force_free_alpha = value;
       alpha_found = true;
-    } else if (key == "amplitude") {
-      g_force_free_amplitude = value;
     }
   }
   file.close();
@@ -795,6 +795,9 @@ void LoadForceFreeParameters() {
         << "Force-free parameter file must provide alpha=" << std::endl
         << "Checked: " << g_force_free_param_file;
     ATHENA_ERROR(msg);
+  }
+  if (g_force_free_amplitude_override) {
+    g_force_free_amplitude = g_force_free_amplitude_override_value;
   }
   g_force_free_loaded = true;
 }
@@ -1390,6 +1393,27 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
     ATHENA_ERROR(msg);
   }
 #endif
+  const Real force_free_bfield_gauss =
+      pin->GetOrAddReal("precipitator", "force_free_bfield_gauss", -1.0);
+  if (force_free_bfield_gauss > 0.0) {
+    if (units == nullptr) {
+      std::stringstream msg;
+      msg << "### FATAL ERROR in precipitator.cpp" << std::endl
+          << "Units object must be configured before force_free_bfield_gauss can be used.";
+      ATHENA_ERROR(msg);
+    }
+    const Real code_bfield_cgs = units->code_magneticfield_cgs;
+    if (!(code_bfield_cgs > 0.0)) {
+      std::stringstream msg;
+      msg << "### FATAL ERROR in precipitator.cpp" << std::endl
+          << "Invalid code magnetic-field unit when processing force_free_bfield_gauss.";
+      ATHENA_ERROR(msg);
+    }
+    g_force_free_amplitude_override = true;
+    g_force_free_amplitude_override_value = force_free_bfield_gauss / code_bfield_cgs;
+  } else {
+    g_force_free_amplitude_override = false;
+  }
 
   const Real He_mass_fraction = pin->GetOrAddReal("hydro", "He_mass_fraction", 0.25);
   const Real hydrogen_mass_fraction = 1.0 - He_mass_fraction;
