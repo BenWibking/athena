@@ -12,7 +12,7 @@ dcycle	   = 1
 <output2>
 file_type  = hdf5
 data_format = float32
-variable   = prim,divB,tcool_myr,delta_rho_over_rho_bar,temperature_K
+variable   = prim,divB,mach_sonic,plasma_beta,tcool_myr,temperature_K,entropy_K,delta_rho_over_rho_bar,delta_entropy_over_entropy_bar,delta_temperature_over_temperature_bar
 cartesian_vector = true
 dcycle	   = 100
 id         = prim
