@@ -109,6 +109,10 @@
 #include <hdf5.h>  // H5[F|P|S|T]_*, H5[A|D|F|P|S|T]*(), hid_t
 #endif
 
+#ifdef OPENPMDOUTPUT
+#include "athena_openpmd.hpp"
+#endif
+
 //----------------------------------------------------------------------------------------
 //! OutputType constructor
 
@@ -402,6 +406,48 @@ Outputs::Outputs(Mesh *pm, ParameterInput *pin) {
 #else
           msg << "### FATAL ERROR in Outputs constructor" << std::endl
               << "Executable not configured for HDF5 outputs, but HDF5 file format "
+              << "is requested in output block '" << op.block_name << "'" << std::endl;
+          ATHENA_ERROR(msg);
+#endif
+        } else if (op.file_type.compare("openpmd") == 0
+                   || op.file_type.compare("opmd") == 0) {
+#ifdef OPENPMDOUTPUT
+          // OpenPMD file format requested
+          //
+          // Check if data format is specified, and if not fall back to default
+          if (pin->DoesParameterExist(op.block_name, "data_format")) {
+            op.data_format = pin->GetString(op.block_name, "data_format");
+          } else {
+            op.data_format.clear(); // empty string means use default
+          }
+          if (op.data_format.empty()) {
+            if (Globals::my_rank == 0) {
+              std::cout << "No data_format specified in output block '"
+                        << op.block_name << "', using default (double)" << std::endl;
+            }
+            pnew_type = new OPENPMDOutput<double>(op);
+          } else if (type_string_check(base_type::F, 32, op)) {
+            if (Globals::my_rank == 0) {
+              std::cout << "Using float data format for openPMD output in block '"
+                        << op.block_name << "'" << std::endl;
+            }
+            pnew_type = new OPENPMDOutput<float>(op);
+          } else if (type_string_check(base_type::F, 64, op)) {
+            if (Globals::my_rank == 0) {
+              std::cout << "Using double data format for openPMD output in block '"
+                        << op.block_name << "'" << std::endl;
+            }
+            pnew_type = new OPENPMDOutput<double>(op);
+          } else {
+            if (Globals::my_rank == 0) {
+              std::cout << "Ignoring unknown data_format '" << op.data_format
+                        << "' in output block '" << op.block_name << "'" << std::endl;
+            }
+            pnew_type = new OPENPMDOutput<double>(op);
+          }
+#else
+          msg << "### FATAL ERROR in Outputs constructor" << std::endl
+              << "Executable not configured for openPMD outputs, but openPMD file format "
               << "is requested in output block '" << op.block_name << "'" << std::endl;
           ATHENA_ERROR(msg);
 #endif
