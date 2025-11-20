@@ -27,6 +27,8 @@
 #   -omp              enable parallelization with OpenMP
 #   -hdf5             enable HDF5 output (requires the HDF5 library)
 #   --hdf5_path=path  path to HDF5 libraries (requires the HDF5 library)
+#   -openpmd          enable openPMD output (requires the openPMD-API library)
+#   --openpmd_path=path  path to openPMD-API libraries
 #   -fft              enable FFT (requires the FFTW library)
 #   --fftw_path=path  path to FFTW libraries (requires the FFTW library)
 #   --grav=xxx        use xxx as the self-gravity solver
@@ -82,6 +84,36 @@ def _discover_hdf5_path_from_env():
         if lib_dir and 'hdf5' in lib_dir.lower() and os.path.isdir(lib_dir):
             prefix = os.path.dirname(lib_dir.rstrip(os.sep))
             if _valid_hdf5_prefix(prefix):
+                return prefix
+    return ''
+
+
+def _valid_openpmd_prefix(path):
+    """Return True if path looks like an openPMD install root (contains lib/lib64)."""
+    if not path:
+        return False
+    lib_dirs = ('lib', 'lib64')
+    return any(os.path.isdir(os.path.join(path, lib_dir)) for lib_dir in lib_dirs)
+
+
+def _discover_openpmd_path_from_env():
+    """Infer the openPMD prefix from common environment variables."""
+    env = os.environ
+    for var in ('OPENPMD_ROOT', 'OPENPMD_DIR', 'openPMD_ROOT', 'openPMD_DIR'):
+        candidate = env.get(var, '').strip()
+        if _valid_openpmd_prefix(candidate):
+            return candidate
+    cmake_prefix = env.get('CMAKE_PREFIX_PATH', '')
+    for entry in cmake_prefix.split(os.pathsep):
+        candidate = entry.strip()
+        if candidate and 'openpmd' in candidate.lower() and _valid_openpmd_prefix(candidate):
+            return candidate
+    ld_paths = env.get('LD_LIBRARY_PATH', '') + os.pathsep + env.get('LIBRARY_PATH', '')
+    for entry in ld_paths.split(os.pathsep):
+        lib_dir = entry.strip()
+        if lib_dir and 'openpmd' in lib_dir.lower() and os.path.isdir(lib_dir):
+            prefix = os.path.dirname(lib_dir.rstrip(os.sep))
+            if _valid_openpmd_prefix(prefix):
                 return prefix
     return ''
 
@@ -279,6 +311,17 @@ parser.add_argument('--hdf5_path',
                     default='',
                     help='path to HDF5 libraries')
 
+# -openpmd argument
+parser.add_argument('-openpmd',
+                    action='store_true',
+                    default=False,
+                    help='enable openPMD Output')
+
+# --openpmd_path argument
+parser.add_argument('--openpmd_path',
+                    default='',
+                    help='path to openPMD-API libraries')
+
 # -nr_radiation argument
 parser.add_argument('-nr_radiation',
                     action='store_true',
@@ -396,6 +439,13 @@ if args['hdf5'] and args['hdf5_path'] == '':
     if detected_hdf5:
         args['hdf5_path'] = detected_hdf5
         print('### CONFIGURE NOTICE: Using HDF5 libraries in {0}'.format(detected_hdf5))
+
+# Auto-discover openPMD path from environment if needed
+if args['openpmd'] and args['openpmd_path'] == '':
+    detected_openpmd = _discover_openpmd_path_from_env()
+    if detected_openpmd:
+        args['openpmd_path'] = detected_openpmd
+        print('### CONFIGURE NOTICE: Using openPMD libraries in {0}'.format(detected_openpmd))
 
 # --- Step 2. Test for incompatible arguments ----------------------------
 
@@ -963,6 +1013,24 @@ if args['h5double']:
 else:
     definitions['H5_DOUBLE_PRECISION_ENABLED'] = '0'
 
+# -openpmd argument
+if args['openpmd']:
+    definitions['OPENPMD_OPTION'] = 'OPENPMDOUTPUT'
+
+    if args['openpmd_path'] != '':
+        makefile_options['PREPROCESSOR_FLAGS'] += ' -I{0}/include'.format(
+            args['openpmd_path'])
+        makefile_options['LINKER_FLAGS'] += ' -L{0}/lib'.format(args['openpmd_path'])
+    if (args['cxx'] == 'g++' or args['cxx'] == 'g++-simd'
+            or args['cxx'] == 'cray' or args['cxx'] == 'icpc'
+            or args['cxx'] == 'icpx' or args['cxx'] == 'icpx-old'
+            or args['cxx'] == 'icpc-debug' or args['cxx'] == 'icpc-phi'
+            or args['cxx'] == 'clang++' or args['cxx'] == 'clang++-simd'
+            or args['cxx'] == 'clang++-apple' or args['cxx'] == 'aocc'):
+        makefile_options['LIBRARY_FLAGS'] += ' -lopenPMD'
+else:
+    definitions['OPENPMD_OPTION'] = 'NO_OPENPMDOUTPUT'
+
 # --cflag=[string] argument
 if args['cflag'] is not None:
     makefile_options['COMPILER_FLAGS'] += ' '+args['cflag']
@@ -1073,6 +1141,7 @@ output_config('FFT', ('ON' if args['fft'] else 'OFF'), flog)
 output_config('HDF5 output', ('ON' if args['hdf5'] else 'OFF'), flog)
 if args['hdf5']:
     output_config('HDF5 precision', ('double' if args['h5double'] else 'single'), flog)
+output_config('openPMD output', ('ON' if args['openpmd'] else 'OFF'), flog)
 output_config('Compiler', args['cxx'], flog)
 output_config('Compilation command', makefile_options['COMPILER_COMMAND'] + ' '
               + makefile_options['PREPROCESSOR_FLAGS'] + ' '

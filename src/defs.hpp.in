@@ -103,6 +103,9 @@
 // HDF5 output (HDF5OUTPUT or NO_HDF5OUTPUT)
 #define @HDF5_OPTION@
 
+// openPMD output (OPENPMDOUTPUT or NO_OPENPMDOUTPUT)
+#define @OPENPMD_OPTION@
+
 // FFTW library (FFT or NO_FFT)
 #define @FFT_OPTION@
 
