@@ -308,23 +308,6 @@ template<> inline hid_t ATHDF5Output<std::uint64_t>::get_mesh_type() {
 }
 #endif
 
-#ifdef OPENPMDOUTPUT
-//----------------------------------------------------------------------------------------
-//! \class OPENPMDOutput
-//! \brief derived OutputType class for OpenPMD files
-
-template <typename opmd_out_t>
-class OPENPMDOutput : public OutputType {
- public:
-  explicit OPENPMDOutput(OutputParameters oparams);
-  void WriteOutputFile(Mesh *pm, ParameterInput *pin, bool flag) override;
-
- private:
-  std::string backend_config_;
-  int coarsening_factor_;
-};
-#endif
-
 //----------------------------------------------------------------------------------------
 //! \class Outputs
 //! \brief root class for all Athena++ outputs. Provides a singly linked list of

@@ -6,6 +6,9 @@
 //! \file athena_openpmd.cpp
 //! \brief openPMD outputs
 
+// Athena++ headers (must include first to get OPENPMDOUTPUT definition)
+#include "../athena.hpp"
+
 // Only proceed if openPMD output enabled
 #ifdef OPENPMDOUTPUT
 
@@ -22,8 +25,7 @@
 // OpenPMD headers
 #include <openPMD/openPMD.hpp>
 
-// Athena++ headers
-#include "../athena.hpp"
+// More Athena++ headers
 #include "../athena_arrays.hpp"
 #include "../coordinates/coordinates.hpp"
 #include "../mesh/mesh.hpp"

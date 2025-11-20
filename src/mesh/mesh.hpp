@@ -235,6 +235,9 @@ class Mesh {
 #ifdef HDF5OUTPUT
   template <typename T> friend class ATHDF5Output;
 #endif
+#ifdef OPENPMDOUTPUT
+  template <typename T> friend class OPENPMDOutput;
+#endif
 
  public:
   // 2x function overloads of ctor: normal and restarted simulation

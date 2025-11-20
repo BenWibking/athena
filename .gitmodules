@@ -1,0 +1,3 @@
+[submodule "extern/openPMD-api"]
+	path = extern/openPMD-api
+	url = https://github.com/openPMD/openPMD-api.git

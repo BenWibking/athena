@@ -1021,6 +1021,7 @@ if args['openpmd']:
         makefile_options['PREPROCESSOR_FLAGS'] += ' -I{0}/include'.format(
             args['openpmd_path'])
         makefile_options['LINKER_FLAGS'] += ' -L{0}/lib'.format(args['openpmd_path'])
+        makefile_options['LINKER_FLAGS'] += ' -Wl,-rpath,{0}/lib'.format(args['openpmd_path'])
     if (args['cxx'] == 'g++' or args['cxx'] == 'g++-simd'
             or args['cxx'] == 'cray' or args['cxx'] == 'icpc'
             or args['cxx'] == 'icpx' or args['cxx'] == 'icpx-old'
