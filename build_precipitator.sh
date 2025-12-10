@@ -12,7 +12,9 @@ cmake -S "${OPENPMD_SRC}" -B "${OPENPMD_BUILD}" \
   -DBUILD_TESTING=OFF \
   -DopenPMD_BUILD_CLI_TOOLS=OFF \
   -DopenPMD_USE_MPI=ON \
-  -DopenPMD_USE_PYTHON=OFF
+  -DopenPMD_USE_PYTHON=OFF \
+  -DopenPMD_USE_ADIOS2=ON \
+  -DopenPMD_USE_HDF5=OFF
 cmake --build "${OPENPMD_BUILD}" --target openPMD -- -j8
 cmake --install "${OPENPMD_BUILD}"
 

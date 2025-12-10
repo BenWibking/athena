@@ -10,7 +10,7 @@ file_type  = hst
 dcycle	   = 1
 
 <output2>
-file_type  = hdf5
+file_type  = openpmd
 data_format = float32
 variable   = prim,divB,mach_sonic,plasma_beta,tcool_myr,temperature_K,entropy_K,delta_rho_over_rho_bar,delta_entropy_over_entropy_bar
 cartesian_vector = true
