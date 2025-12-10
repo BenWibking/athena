@@ -13,12 +13,8 @@
 #ifdef OPENPMDOUTPUT
 
 // C++ headers
-#include <algorithm>
 #include <cstdint>
-#include <cstdio>
-#include <iomanip>
 #include <iostream>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -66,10 +62,7 @@ void OPENPMDOutput<opmd_out_t>::WriteOutputFile(Mesh *pm, ParameterInput *pin,
   std::string filename = output_params.file_basename;
   filename.append(".");
   filename.append(output_params.file_id);
-  filename.append(".");
-  std::stringstream file_number;
-  file_number << std::setw(5) << std::setfill('0') << output_params.file_number;
-  filename.append(file_number.str());
+  filename.append(".%05T");  // required by openPMD for fileBased iteration encoding
   if (flag) {  // final output
     filename.append(".final");
   }
