@@ -1027,10 +1027,12 @@ if args['openpmd']:
     definitions['OPENPMD_OPTION'] = 'OPENPMDOUTPUT'
 
     if args['openpmd_path'] != '':
+        prefix_abs = os.path.abspath(args['openpmd_path'])
         makefile_options['PREPROCESSOR_FLAGS'] += ' -I{0}/include'.format(
-            args['openpmd_path'])
-        lib_dir = _preferred_lib_dir(args['openpmd_path'])
+            prefix_abs)
+        lib_dir = _preferred_lib_dir(prefix_abs)
         makefile_options['LINKER_FLAGS'] += ' -L{0}'.format(lib_dir)
+        # Use an absolute RPATH so binaries can be relocated safely.
         makefile_options['LINKER_FLAGS'] += ' -Wl,-rpath,{0}'.format(lib_dir)
     if (args['cxx'] == 'g++' or args['cxx'] == 'g++-simd'
             or args['cxx'] == 'cray' or args['cxx'] == 'icpc'
