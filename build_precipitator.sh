@@ -16,5 +16,5 @@ cmake -S "${OPENPMD_SRC}" -B "${OPENPMD_BUILD}" \
 cmake --build "${OPENPMD_BUILD}" --target openPMD -- -j8
 cmake --install "${OPENPMD_BUILD}"
 
-python3 configure.py -openpmd --openpmd_path "${OPENPMD_PREFIX}" --prob precipitator --flux hlld --coord spherical_polar -mpi -b
+python3 configure.py -openpmd --openpmd_path "${OPENPMD_PREFIX}" --prob precipitator --flux hlld --coord spherical_polar -mpi -b --nghost=3
 make -j8
