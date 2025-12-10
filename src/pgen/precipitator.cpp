@@ -522,10 +522,6 @@ void ApplyInnerSponge(MeshBlock *pmb) {
   if (!g_profile || g_inner_sponge_tau <= 0.0) {
     return;
   }
-  Units *units = pmb->pmy_mesh->punit;
-  if (units == nullptr) {
-    return;
-  }
   Mesh *mesh = pmb->pmy_mesh;
   if (mesh == nullptr) {
     return;
@@ -577,20 +573,6 @@ void ApplyInnerSponge(MeshBlock *pmb) {
         if (alpha <= 0.0) {
           continue;
         }
-
-        const Real rho_target = SampleBackgroundDensityCode(radius_code, units);
-#if NON_BAROTROPIC_EOS
-        const Real pressure_target = SampleBackgroundPressureCode(radius_code, units);
-#endif
-
-        Real &rho = prim(IDN, k, j, i);
-        rho += alpha * (rho_target - rho);
-
-#if NON_BAROTROPIC_EOS
-        Real &pressure = prim(IPR, k, j, i);
-        pressure += alpha * (pressure_target - pressure);
-#endif
-
         prim(IVX, k, j, i) *= (1.0 - alpha);
         prim(IVY, k, j, i) *= (1.0 - alpha);
         prim(IVZ, k, j, i) *= (1.0 - alpha);
