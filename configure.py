@@ -96,6 +96,15 @@ def _valid_openpmd_prefix(path):
     return any(os.path.isdir(os.path.join(path, lib_dir)) for lib_dir in lib_dirs)
 
 
+def _preferred_lib_dir(prefix):
+    """Return the first existing lib directory under prefix, preferring lib64."""
+    for lib_dir in ('lib64', 'lib'):
+        candidate = os.path.join(prefix, lib_dir)
+        if os.path.isdir(candidate):
+            return candidate
+    return os.path.join(prefix, 'lib')
+
+
 def _discover_openpmd_path_from_env():
     """Infer the openPMD prefix from common environment variables."""
     env = os.environ
@@ -1020,8 +1029,9 @@ if args['openpmd']:
     if args['openpmd_path'] != '':
         makefile_options['PREPROCESSOR_FLAGS'] += ' -I{0}/include'.format(
             args['openpmd_path'])
-        makefile_options['LINKER_FLAGS'] += ' -L{0}/lib'.format(args['openpmd_path'])
-        makefile_options['LINKER_FLAGS'] += ' -Wl,-rpath,{0}/lib'.format(args['openpmd_path'])
+        lib_dir = _preferred_lib_dir(args['openpmd_path'])
+        makefile_options['LINKER_FLAGS'] += ' -L{0}'.format(lib_dir)
+        makefile_options['LINKER_FLAGS'] += ' -Wl,-rpath,{0}'.format(lib_dir)
     if (args['cxx'] == 'g++' or args['cxx'] == 'g++-simd'
             or args['cxx'] == 'cray' or args['cxx'] == 'icpc'
             or args['cxx'] == 'icpx' or args['cxx'] == 'icpx-old'
