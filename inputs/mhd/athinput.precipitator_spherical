@@ -10,7 +10,7 @@ file_type  = hst
 dcycle	   = 1
 
 <output2>
-file_type  = openpmd
+file_type  = hdf5
 data_format = float32
 variable   = prim,divB,mach_sonic,plasma_beta,tcool_myr,temperature_K,entropy_K,delta_rho_over_rho_bar,delta_entropy_over_entropy_bar
 cartesian_vector = true
@@ -52,9 +52,9 @@ ix3_bc = periodic
 ox3_bc = periodic
 
 <meshblock>
-nx1 = 16
-nx2 = 16
-nx3 = 16
+nx1 = 32
+nx2 = 32
+nx3 = 32
 
 <hydro>
 gamma = 1.6666666666666667
