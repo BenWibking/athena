@@ -7,14 +7,14 @@ problem_id = precipitator
 
 <output1>
 file_type  = hst
-dcycle	   = 1
+dcycle	   = 1000
 
 <output2>
 file_type  = hdf5
 data_format = float32
 variable   = prim,divB,mach_sonic,plasma_beta,tcool_myr,temperature_K,entropy_K,delta_rho_over_rho_bar,delta_entropy_over_entropy_bar
 cartesian_vector = true
-dcycle	   = 100
+dt         = 100
 id         = prim
 
 <output3>
@@ -24,11 +24,11 @@ id          = restart
 dcycle	    = 10000
 
 <time>
-cfl_number = 0.2
+cfl_number = 0.25
 nlim       = 500000
-tlim       = 1.0e3
+tlim       = 1.0e4
 integrator = rk2
-xorder 	   = 3c
+xorder 	   = 2mc
 ncycle_out = 1
 
 <mesh>
@@ -52,9 +52,9 @@ ix3_bc = periodic
 ox3_bc = periodic
 
 <meshblock>
-nx1 = 32
-nx2 = 32
-nx3 = 32
+nx1 = 16
+nx2 = 16
+nx3 = 16
 
 <hydro>
 gamma = 1.6666666666666667

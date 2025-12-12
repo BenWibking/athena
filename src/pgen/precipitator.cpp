@@ -184,6 +184,7 @@ bool g_radial_density_ready = false;
 Real PrecipitatorThetaGrid(Real x2, RegionSize rs);
 void ApplyInnerSponge(MeshBlock *pmb);
 Real ComputeCellTemperature(Real rho_code, Real pressure_code, const Units &units);
+Real HistoryMagicHeatingRate(MeshBlock *pmb, int iout);
 
 std::int64_t ComputeGlobalX1Offset(const MeshBlock &pmb, int nx1_total) {
   const std::int64_t cell_count = static_cast<std::int64_t>(pmb.block_size.nx1);
@@ -724,6 +725,67 @@ Real SampleMagicHeatingError(Real coord_value) {
   const Real a = g_magic_error_profile[static_cast<std::size_t>(idx)];
   const Real b = g_magic_error_profile[static_cast<std::size_t>(idx + 1)];
   return a + frac * (b - a);
+}
+
+Real HistoryMagicHeatingRate(MeshBlock *pmb, int iout) {
+  (void)iout;
+  const bool heating_enabled = g_enable_magic_heating && (g_powerlaw_lambda_code > 0.0) &&
+                               (g_magic_profile_bins > 0) && (g_magic_c_v > 0.0) &&
+                               (g_magic_Kp != 0.0) && g_magic_profile_ready;
+  if (!heating_enabled || pmb == nullptr || pmb->phydro == nullptr) {
+    return 0.0;
+  }
+
+  Units *units = pmb->pmy_mesh->punit;
+  if (units == nullptr) {
+    return 0.0;
+  }
+
+  Coordinates *pcoord = pmb->pcoord;
+  AthenaArray<Real> &cons = pmb->phydro->u;
+
+  Real heating_rate = 0.0;
+  for (int k = pmb->ks; k <= pmb->ke; ++k) {
+    for (int j = pmb->js; j <= pmb->je; ++j) {
+      for (int i = pmb->is; i <= pmb->ie; ++i) {
+        const Real radius_code = pcoord->x1v(i);
+        const Real err = SampleMagicHeatingError(radius_code);
+        if (err == 0.0) {
+          continue;
+        }
+        const Real taper = MagicHeatingTaper(radius_code);
+        if (taper <= 0.0) {
+          continue;
+        }
+
+        const Real rho = cons(IDN, k, j, i);
+        if (rho <= 0.0) {
+          continue;
+        }
+
+        const Real rho_bg = SampleBackgroundDensityCode(radius_code, units);
+        const Real pressure_bg = SampleBackgroundPressureCode(radius_code, units);
+        Real inv_t_cool = 0.0;
+        if (rho_bg > 0.0 && pressure_bg > 0.0 && g_powerlaw_lambda_code > 0.0) {
+          const Real thermal_bg = pressure_bg / g_gm1;
+          const Real cooling_strength = g_powerlaw_lambda_code * rho_bg * rho_bg;
+          if (thermal_bg > 0.0 && cooling_strength > 0.0) {
+            const Real t_cool = thermal_bg / cooling_strength;
+            if (t_cool > 0.0) {
+              inv_t_cool = 1.0 / t_cool;
+            }
+          }
+        }
+        if (inv_t_cool <= 0.0) {
+          continue;
+        }
+
+        const Real dE_dt = -taper * rho * g_magic_c_v * inv_t_cool * (g_magic_Kp * err);
+        heating_rate += dE_dt * pcoord->GetCellVolume(k, j, i);
+      }
+    }
+  }
+  return heating_rate;
 }
 
 std::string Trim(const std::string &input) {
@@ -1532,6 +1594,11 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
     g_pert_coeff_sin.clear();
     g_pert_k_values.clear();
     g_pert_radial_weight.clear();
+  }
+
+  if (g_enable_magic_heating) {
+    AllocateUserHistoryOutput(1);
+    EnrollUserHistoryOutput(0, HistoryMagicHeatingRate, "magic_heat_rate");
   }
 
   EnrollUserExplicitSourceFunction(PrecipitatorGravity);
