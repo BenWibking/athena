@@ -71,7 +71,8 @@ time_cgs    = 3.15576e+13
 hse_profile_filename = inputs/hse_3.0.txt
 uniform_init = 0
 force_free_param_file = inputs/force_free_params.txt
-force_free_bfield_gauss = 1.0e-4  # 100 microGauss
+#force_free_bfield_gauss = 1.0e-4  # 100 microGauss
+force_free_bfield_gauss = 0.
 inner_sponge_tau      = 5.0	   # Myr
 inner_sponge_radius   = 10.0	   # kpc
 
@@ -89,4 +90,4 @@ perturbation_seed = 88172645463393265
 enable_heating = magic
 thermostat_temperature = 1.0e7
 thermostat_Kp = 10.0
-h_smooth_heatcool = 10.0
+h_smooth_heatcool = 20.0
