@@ -4,9 +4,10 @@ set -euxo pipefail
 OPENPMD_SRC="extern/openPMD-api"
 OPENPMD_BUILD="${OPENPMD_SRC}/build"
 OPENPMD_PREFIX="${OPENPMD_BUILD}/install"
+ENABLE_OPENPMD="${ENABLE_OPENPMD:-0}"
 
 detect_hdf5_prefix() {
-  local candidate prefix
+  local candidate prefix tool
   for var in HDF5_ROOT HDF5_DIR HDF5_HOME; do
     candidate="${!var-}"
     if [[ -n "${candidate}" && ( -d "${candidate}/lib" || -d "${candidate}/lib64" ) ]]; then
@@ -42,6 +43,20 @@ detect_hdf5_prefix() {
         fi
         ;;
     esac
+  done
+
+  for tool in h5pcc h5cc; do
+    candidate="$(command -v "${tool}" 2>/dev/null || true)"
+    if [[ -z "${candidate}" || ! -x "${candidate}" ]]; then
+      continue
+    fi
+
+    prefix="$("${candidate}" -showconfig 2>/dev/null \
+      | awk -F: '/Installation point/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}')"
+    if [[ -n "${prefix}" && ( -d "${prefix}/lib" || -d "${prefix}/lib64" ) ]]; then
+      echo "${prefix}"
+      return 0
+    fi
   done
 
   return 1
@@ -146,8 +161,13 @@ find_openpmd_lib() {
 }
 
 HDF5_PREFIX="$(detect_hdf5_prefix || true)"
-CONFIGURE_ARGS=(-openpmd --openpmd_path "${OPENPMD_PREFIX}" -hdf5 --prob precipitator
-  --flux hlld --coord spherical_polar -mpi -b --nghost=3)
+CONFIGURE_ARGS=(-hdf5 --prob precipitator --flux hlld --coord spherical_polar -mpi -b --nghost=3)
+if [[ "${ENABLE_OPENPMD}" == "1" ]]; then
+  CONFIGURE_ARGS=(-openpmd --openpmd_path "${OPENPMD_PREFIX}" "${CONFIGURE_ARGS[@]}")
+  echo "### openPMD support enabled (ENABLE_OPENPMD=1)"
+else
+  echo "### openPMD support disabled (set ENABLE_OPENPMD=1 to enable)"
+fi
 if [[ -n "${HDF5_PREFIX}" ]]; then
   echo "### Using HDF5 from ${HDF5_PREFIX}"
   CONFIGURE_ARGS+=(--hdf5_path "${HDF5_PREFIX}")
@@ -157,34 +177,44 @@ fi
 
 MPI_FLAVOR="$(detect_mpi_flavor || true)"
 HDF5_MPI_FLAVOR="$(detect_hdf5_mpi_flavor "${HDF5_PREFIX}")"
-if [[ "${HDF5_MPI_FLAVOR}" != "serial" && "${HDF5_MPI_FLAVOR}" != "unknown" && "${HDF5_MPI_FLAVOR}" != "mpi-unknown" ]]; then
+if [[ "${HDF5_MPI_FLAVOR}" == "serial" ]]; then
+  echo "### ERROR: Detected serial HDF5 at ${HDF5_PREFIX}, but this build uses -mpi and requires parallel HDF5. Set HDF5_ROOT/HDF5_DIR/HDF5_HOME to a parallel HDF5 installation and rerun." >&2
+  exit 1
+fi
+if [[ "${HDF5_MPI_FLAVOR}" != "unknown" && "${HDF5_MPI_FLAVOR}" != "mpi-unknown" ]]; then
   if [[ "${MPI_FLAVOR}" != "${HDF5_MPI_FLAVOR}" ]]; then
     echo "### ERROR: HDF5 was built with MPI (${HDF5_MPI_FLAVOR}) while mpicxx appears to use '${MPI_FLAVOR}'. Mixing MPI implementations will fail; rebuild HDF5 or switch to a matching MPI toolchain." >&2
     exit 1
   fi
 fi
 
-OPENPMD_LIB="$(find_openpmd_lib || true)"
-if [[ -n "${OPENPMD_LIB}" ]]; then
-  OPENPMD_MPI_FLAVOR="$(detect_library_mpi_flavor "${OPENPMD_LIB}")"
-  if [[ "${OPENPMD_MPI_FLAVOR}" != "unknown" && "${MPI_FLAVOR}" != "unknown" && "${OPENPMD_MPI_FLAVOR}" != "${MPI_FLAVOR}" ]]; then
-    echo "### ERROR: openPMD library at ${OPENPMD_LIB} appears to be built with ${OPENPMD_MPI_FLAVOR}, but mpicxx is ${MPI_FLAVOR}. Please remove ${OPENPMD_BUILD} (and ${OPENPMD_PREFIX}) and rebuild with a consistent MPI stack." >&2
-    exit 1
+if [[ "${ENABLE_OPENPMD}" == "1" ]]; then
+  OPENPMD_LIB="$(find_openpmd_lib || true)"
+  if [[ -n "${OPENPMD_LIB}" ]]; then
+    OPENPMD_MPI_FLAVOR="$(detect_library_mpi_flavor "${OPENPMD_LIB}")"
+    if [[ "${OPENPMD_MPI_FLAVOR}" != "unknown" && "${MPI_FLAVOR}" != "unknown" && "${OPENPMD_MPI_FLAVOR}" != "${MPI_FLAVOR}" ]]; then
+      echo "### ERROR: openPMD library at ${OPENPMD_LIB} appears to be built with ${OPENPMD_MPI_FLAVOR}, but mpicxx is ${MPI_FLAVOR}. Please remove ${OPENPMD_BUILD} (and ${OPENPMD_PREFIX}) and rebuild with a consistent MPI stack." >&2
+      exit 1
+    fi
   fi
+
+  cmake -S "${OPENPMD_SRC}" -B "${OPENPMD_BUILD}" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="${OPENPMD_PREFIX}" \
+    -DBUILD_SHARED_LIBS=ON \
+    -DBUILD_TESTING=OFF \
+    -DopenPMD_BUILD_CLI_TOOLS=OFF \
+    -DopenPMD_USE_MPI=ON \
+    -DopenPMD_USE_PYTHON=OFF \
+    -DopenPMD_USE_ADIOS2=ON \
+    -DopenPMD_USE_HDF5=OFF
+  cmake --build "${OPENPMD_BUILD}" --target openPMD -- -j8
+  cmake --install "${OPENPMD_BUILD}"
 fi
 
-cmake -S "${OPENPMD_SRC}" -B "${OPENPMD_BUILD}" \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_INSTALL_PREFIX="${OPENPMD_PREFIX}" \
-  -DBUILD_SHARED_LIBS=ON \
-  -DBUILD_TESTING=OFF \
-  -DopenPMD_BUILD_CLI_TOOLS=OFF \
-  -DopenPMD_USE_MPI=ON \
-  -DopenPMD_USE_PYTHON=OFF \
-  -DopenPMD_USE_ADIOS2=ON \
-  -DopenPMD_USE_HDF5=OFF
-cmake --build "${OPENPMD_BUILD}" --target openPMD -- -j8
-cmake --install "${OPENPMD_BUILD}"
+if [[ -f Makefile ]]; then
+  make clean
+fi
 
 python3 configure.py "${CONFIGURE_ARGS[@]}"
 make -j8

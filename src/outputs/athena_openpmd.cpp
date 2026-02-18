@@ -56,6 +56,7 @@ void OPENPMDOutput<opmd_out_t>::WriteOutputFile(Mesh *pm, ParameterInput *pin,
                 << "Ghost zones are not supported by openPMD-API." << std::endl
                 << "Outputting interior cells only." << std::endl;
     }
+    output_params.include_ghost_zones = false;  // hard-disable to avoid accidental use
   }
 
   // Determine file name
@@ -231,11 +232,11 @@ void OPENPMDOutput<opmd_out_t>::WriteVariableData(openPMD::Iteration& it, Mesh *
 
   // Set output indices (interior cells only)
   out_is = pmb->is;
-  out_ie = pmb->ie;
+  out_ie = out_is + pmb->block_size.nx1 - 1;
   out_js = pmb->js;
-  out_je = pmb->je;
+  out_je = out_js + pmb->block_size.nx2 - 1;
   out_ks = pmb->ks;
-  out_ke = pmb->ke;
+  out_ke = out_ks + pmb->block_size.nx3 - 1;
 
   // Determine output size per block
   int nx1 = pmb->block_size.nx1;
@@ -261,7 +262,14 @@ void OPENPMDOutput<opmd_out_t>::WriteVariableData(openPMD::Iteration& it, Mesh *
     auto mesh_record = it.meshes[record_name];
 
     // Set mesh geometry and properties
-    mesh_record.setGeometry(openPMD::Mesh::Geometry::cartesian);
+    std::string coord_system(COORDINATE_SYSTEM);
+    openPMD::Mesh::Geometry geometry = openPMD::Mesh::Geometry::cartesian;
+    if (coord_system == "spherical_polar") {
+      geometry = openPMD::Mesh::Geometry::spherical;
+    } else if (coord_system == "cylindrical") {
+      geometry = openPMD::Mesh::Geometry::cylindrical;
+    }
+    mesh_record.setGeometry(geometry);
     mesh_record.setDataOrder(openPMD::Mesh::DataOrder::C);
 
     // Calculate grid spacing at finest level
@@ -272,21 +280,25 @@ void OPENPMDOutput<opmd_out_t>::WriteVariableData(openPMD::Iteration& it, Mesh *
     Real dx3 = (pm->mesh_size.x3max - pm->mesh_size.x3min) /
                (pm->mesh_size.nx3 * (1 << (pm->current_level - pm->root_level)));
 
-    // Set grid properties based on dimensionality
-    if (pm->ndim == 3) {
-      mesh_record.setGridSpacing(std::vector<Real>{dx3, dx2, dx1});
-      mesh_record.setAxisLabels({"z", "y", "x"});
-      mesh_record.setGridGlobalOffset(
-          {pm->mesh_size.x3min, pm->mesh_size.x2min, pm->mesh_size.x1min});
-    } else if (pm->ndim == 2) {
-      mesh_record.setGridSpacing(std::vector<Real>{dx2, dx1});
-      mesh_record.setAxisLabels({"y", "x"});
-      mesh_record.setGridGlobalOffset({pm->mesh_size.x2min, pm->mesh_size.x1min});
-    } else {  // 1D
-      mesh_record.setGridSpacing(std::vector<Real>{dx1});
-      mesh_record.setAxisLabels({"x"});
-      mesh_record.setGridGlobalOffset({pm->mesh_size.x1min});
+    // Set grid properties based on dimensionality, with x1 -> x2 -> x3 ordering
+    std::vector<Real> grid_spacing = {dx1, dx2, dx3};
+    std::vector<Real> grid_offset = {pm->mesh_size.x1min, pm->mesh_size.x2min,
+                                     pm->mesh_size.x3min};
+    std::vector<std::string> axis_labels;
+    if (coord_system == "spherical_polar") {
+      axis_labels = {"r", "theta", "phi"};
+    } else if (coord_system == "cylindrical") {
+      axis_labels = {"r", "phi", "z"};
+    } else {
+      axis_labels = {"x", "y", "z"};
     }
+    grid_spacing.resize(pm->ndim);
+    grid_offset.resize(pm->ndim);
+    axis_labels.resize(pm->ndim);
+
+    mesh_record.setGridSpacing(grid_spacing);
+    mesh_record.setAxisLabels(axis_labels);
+    mesh_record.setGridGlobalOffset(grid_offset);
 
     // Loop through components
     for (int comp = 0; comp < num_components; ++comp) {
@@ -319,9 +331,9 @@ void OPENPMDOutput<opmd_out_t>::WriteVariableData(openPMD::Iteration& it, Mesh *
 
       openPMD::Extent global_extent;
       if (pm->ndim == 3) {
-        global_extent = {global_nx3, global_nx2, global_nx1};
+        global_extent = {global_nx1, global_nx2, global_nx3};
       } else if (pm->ndim == 2) {
-        global_extent = {global_nx2, global_nx1};
+        global_extent = {global_nx1, global_nx2};
       } else {
         global_extent = {global_nx1};
       }
@@ -344,11 +356,11 @@ void OPENPMDOutput<opmd_out_t>::WriteVariableData(openPMD::Iteration& it, Mesh *
 
     // Reset output indices
     out_is = pmb->is;
-    out_ie = pmb->ie;
+    out_ie = out_is + pmb->block_size.nx1 - 1;
     out_js = pmb->js;
-    out_je = pmb->je;
+    out_je = out_js + pmb->block_size.nx2 - 1;
     out_ks = pmb->ks;
-    out_ke = pmb->ke;
+    out_ke = out_ks + pmb->block_size.nx3 - 1;
 
     // Load output data for this block
     LoadOutputData(pmb);
@@ -400,13 +412,26 @@ void OPENPMDOutput<opmd_out_t>::WriteVariableData(openPMD::Iteration& it, Mesh *
         // Allocate buffer
         std::vector<opmd_out_t> buffer(buffer_size);
 
-        // Copy data from AthenaArray to buffer
+        // Copy data from AthenaArray to buffer; dataset dimensions are {x1,x2,x3}
         int index = 0;
-        for (int k = out_ks; k <= out_ke; ++k) {
-          for (int j = out_js; j <= out_je; ++j) {
-            for (int i = out_is; i <= out_ie; ++i) {
-              buffer[index++] = static_cast<opmd_out_t>(pod->data(comp, k, j, i));
+        if (pm->ndim == 3) {
+          for (int i = out_is; i <= out_ie; ++i) {
+            for (int j = out_js; j <= out_je; ++j) {
+              for (int k = out_ks; k <= out_ke; ++k) {
+                buffer[index++] = static_cast<opmd_out_t>(pod->data(comp, k, j, i));
+              }
             }
+          }
+        } else if (pm->ndim == 2) {
+          for (int i = out_is; i <= out_ie; ++i) {
+            for (int j = out_js; j <= out_je; ++j) {
+              buffer[index++] = static_cast<opmd_out_t>(pod->data(comp, out_ks, j, i));
+            }
+          }
+        } else {
+          for (int i = out_is; i <= out_ie; ++i) {
+            buffer[index++] = static_cast<opmd_out_t>(
+                pod->data(comp, out_ks, out_js, i));
           }
         }
 
@@ -446,11 +471,11 @@ OPENPMDOutput<opmd_out_t>::GetChunkOffsetAndExtent(Mesh *pm, MeshBlock *pmb,
   std::uint64_t offset_x3 = pmb->loc.lx3 * nx3;
 
   if (pm->ndim == 3) {
-    chunk_offset = {offset_x3, offset_x2, offset_x1};
-    chunk_extent = {nx3, nx2, nx1};
+    chunk_offset = {offset_x1, offset_x2, offset_x3};
+    chunk_extent = {nx1, nx2, nx3};
   } else if (pm->ndim == 2) {
-    chunk_offset = {offset_x2, offset_x1};
-    chunk_extent = {nx2, nx1};
+    chunk_offset = {offset_x1, offset_x2};
+    chunk_extent = {nx1, nx2};
   } else {
     chunk_offset = {offset_x1};
     chunk_extent = {nx1};
