@@ -62,6 +62,20 @@ detect_hdf5_prefix() {
   return 1
 }
 
+classify_mpi_flavor_from_text() {
+  local lowered="$1"
+  # Intel MPI often appears as oneAPI MPI paths or impi module paths.
+  if grep -Eqi '(^|[^[:alnum:]_])(intel[[:space:]_-]*mpi|i_mpi|oneapi/mpi|/impi[0-9_/.-]*)([^[:alnum:]_]|$)' <<<"${lowered}"; then
+    echo "intelmpi"
+  elif grep -Eqi '(^|[^[:alnum:]_])(mpich|hydra|libmpich)([^[:alnum:]_]|$)' <<<"${lowered}"; then
+    echo "mpich"
+  elif grep -Eqi '(^|[^[:alnum:]_])(open[[:space:]_-]*mpi|ompi|libmpi_ompi|libopen-rte|libopen-pal)([^[:alnum:]_]|$)' <<<"${lowered}"; then
+    echo "openmpi"
+  else
+    echo "unknown"
+  fi
+}
+
 detect_mpi_flavor() {
   local output lowered
   if ! command -v mpicxx >/dev/null 2>&1; then
@@ -70,13 +84,7 @@ detect_mpi_flavor() {
   fi
   output=$(mpicxx -show 2>/dev/null || true)
   lowered=$(printf '%s' "${output}" | tr '[:upper:]' '[:lower:]')
-  if [[ "${lowered}" == *mpich* ]]; then
-    echo "mpich"
-  elif [[ "${lowered}" == *openmpi* || "${lowered}" == *ompi* ]]; then
-    echo "openmpi"
-  else
-    echo "unknown"
-  fi
+  classify_mpi_flavor_from_text "${lowered}"
 }
 
 detect_library_mpi_flavor() {
@@ -94,13 +102,7 @@ detect_library_mpi_flavor() {
     return 1
   fi
   lowered=$(printf '%s' "${deps}" | tr '[:upper:]' '[:lower:]')
-  if [[ "${lowered}" == *openmpi* || "${lowered}" == *ompi* ]]; then
-    echo "openmpi"
-  elif [[ "${lowered}" == *mpich* ]]; then
-    echo "mpich"
-  else
-    echo "unknown"
-  fi
+  classify_mpi_flavor_from_text "${lowered}"
 }
 
 find_hdf5_showconfig_tool() {
@@ -119,7 +121,7 @@ find_hdf5_showconfig_tool() {
 }
 
 detect_hdf5_mpi_flavor() {
-  local prefix="${1-}" tool config lowered parallel_setting
+  local prefix="${1-}" tool config lowered parallel_setting compiler_hints flavor
   tool=$(find_hdf5_showconfig_tool "${prefix}" || true)
   if [[ -z "${tool}" ]]; then
     echo "unknown"
@@ -144,10 +146,24 @@ detect_hdf5_mpi_flavor() {
     echo "serial"
     return 0
   fi
-  if [[ "${lowered}" == *mpich* ]]; then
-    echo "mpich"
-  elif [[ "${lowered}" == *openmpi* || "${lowered}" == *ompi* ]]; then
-    echo "openmpi"
+
+  compiler_hints=$(
+    awk -F: '
+      /^[[:space:]]*(C Compiler|Fortran Compiler|C\+\+ Compiler|Extra libraries|LDFLAGS|AM_LDFLAGS)[[:space:]]*:/ {
+        v=$2
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+        print tolower(v)
+      }' <<<"${config}"
+  )
+  flavor=$(classify_mpi_flavor_from_text "${compiler_hints}")
+  if [[ "${flavor}" != "unknown" ]]; then
+    echo "${flavor}"
+    return 0
+  fi
+
+  flavor=$(classify_mpi_flavor_from_text "${lowered}")
+  if [[ "${flavor}" != "unknown" ]]; then
+    echo "${flavor}"
   else
     echo "mpi-unknown"
   fi
