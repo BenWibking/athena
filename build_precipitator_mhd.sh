@@ -119,7 +119,7 @@ find_hdf5_showconfig_tool() {
 }
 
 detect_hdf5_mpi_flavor() {
-  local prefix="${1-}" tool config lowered
+  local prefix="${1-}" tool config lowered parallel_setting
   tool=$(find_hdf5_showconfig_tool "${prefix}" || true)
   if [[ -z "${tool}" ]]; then
     echo "unknown"
@@ -133,7 +133,14 @@ detect_hdf5_mpi_flavor() {
   fi
 
   lowered=$(printf '%s' "${config}" | tr '[:upper:]' '[:lower:]')
-  if ! grep -qi "parallel hdf5:[[:space:]]*on" <<<"${config}"; then
+  parallel_setting=$(awk -F: '
+    /^[[:space:]]*parallel hdf5[[:space:]]*:/ {
+      v=$2
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+      print tolower(v)
+      exit
+    }' <<<"${config}")
+  if [[ -n "${parallel_setting}" && ! "${parallel_setting}" =~ ^(on|yes|true|1)$ ]]; then
     echo "serial"
     return 0
   fi
