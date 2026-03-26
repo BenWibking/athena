@@ -144,8 +144,8 @@ std::string g_force_free_param_file;
 bool g_force_free_loaded = false;
 Real g_force_free_alpha = 0.0;
 Real g_force_free_amplitude = 1.0;
-bool g_force_free_amplitude_override = false;
-Real g_force_free_amplitude_override_value = 1.0;
+bool g_force_free_bfield_override = false;
+Real g_force_free_bfield_override_value = 1.0;
 
 bool g_enable_density_perturbations = false;
 Real g_pert_sigma = 0.0;
@@ -840,8 +840,18 @@ void LoadForceFreeParameters() {
         << "Checked: " << g_force_free_param_file;
     ATHENA_ERROR(msg);
   }
-  if (g_force_free_amplitude_override) {
-    g_force_free_amplitude = g_force_free_amplitude_override_value;
+  if (g_force_free_bfield_override) {
+    const Real small_radius_bfield_per_amplitude =
+        (2.0 / 3.0) * std::abs(g_force_free_alpha);
+    if (!(small_radius_bfield_per_amplitude > 0.0)) {
+      std::stringstream msg;
+      msg << "### FATAL ERROR in precipitator.cpp" << std::endl
+          << "force_free_bfield_gauss requires a non-zero alpha to define the "
+             "small-radius characteristic field.";
+      ATHENA_ERROR(msg);
+    }
+    g_force_free_amplitude =
+        g_force_free_bfield_override_value / small_radius_bfield_per_amplitude;
   }
   g_force_free_loaded = true;
 }
@@ -1453,10 +1463,10 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
           << "Invalid code magnetic-field unit when processing force_free_bfield_gauss.";
       ATHENA_ERROR(msg);
     }
-    g_force_free_amplitude_override = true;
-    g_force_free_amplitude_override_value = force_free_bfield_gauss / code_bfield_cgs;
+    g_force_free_bfield_override = true;
+    g_force_free_bfield_override_value = force_free_bfield_gauss / code_bfield_cgs;
   } else {
-    g_force_free_amplitude_override = false;
+    g_force_free_bfield_override = false;
   }
 
   const Real He_mass_fraction = pin->GetOrAddReal("hydro", "He_mass_fraction", 0.25);
