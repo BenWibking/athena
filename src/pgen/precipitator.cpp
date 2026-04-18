@@ -201,6 +201,7 @@ Real ComputeCellTemperature(Real rho_code, Real pressure_code, const Units &unit
 Real HistoryMagicHeatingRate(MeshBlock *pmb, int iout);
 Real CellCenterRadiusCode(const Coordinates *coord, int k, int j, int i);
 bool InOuterBufferHalo(Real radius_code);
+Real OuterBufferHeatCoolTaper(Real radius_code, Real outer_radius_code);
 
 std::int64_t ComputeGlobalX1Offset(const MeshBlock &pmb, int nx1_total) {
   const std::int64_t cell_count = static_cast<std::int64_t>(pmb.block_size.nx1);
@@ -646,6 +647,24 @@ bool InOuterBufferHalo(Real radius_code) {
          (radius_code > g_outer_buffer_inner_radius_code);
 }
 
+Real OuterBufferHeatCoolTaper(Real radius_code, Real outer_radius_code) {
+  if (!g_enable_outer_buffer_halo) {
+    return 1.0;
+  }
+  if (radius_code <= g_outer_buffer_inner_radius_code) {
+    return 1.0;
+  }
+  if (!(outer_radius_code > g_outer_buffer_inner_radius_code)) {
+    return 0.0;
+  }
+
+  Real frac = (outer_radius_code - radius_code) /
+              (outer_radius_code - g_outer_buffer_inner_radius_code);
+  frac = std::max(static_cast<Real>(0.0), std::min(frac, static_cast<Real>(1.0)));
+  // Smoothstep taper keeps the source term C1-continuous at both ends.
+  return frac * frac * (3.0 - 2.0 * frac);
+}
+
 void ApplyInnerSponge(MeshBlock *pmb) {
   if (pmb == nullptr || pmb->phydro == nullptr) {
     return;
@@ -863,6 +882,7 @@ void UpdateMagicHeatingProfile(Mesh *mesh, Real time, Real dt) {
   const Real extent = x1max - x1min;
   const bool has_extent = (num_bins > 1) && (extent > 0.0);
   const Real inv_dr = has_extent ? static_cast<Real>(num_bins) / extent : 0.0;
+  const Real outer_radius_code = mesh->mesh_size.x1max;
 
   for (int block = 0; block < mesh->nblocal; ++block) {
     MeshBlock *pmb = mesh->my_blocks(block);
@@ -875,7 +895,8 @@ void UpdateMagicHeatingProfile(Mesh *mesh, Real time, Real dt) {
       for (int j = pmb->js; j <= pmb->je; ++j) {
         for (int i = pmb->is; i <= pmb->ie; ++i) {
           const Real r = CellCenterRadiusCode(coord, k, j, i);
-          if (InOuterBufferHalo(r)) {
+          const Real outer_taper = OuterBufferHeatCoolTaper(r, outer_radius_code);
+          if (outer_taper <= 0.0) {
             continue;
           }
           int idx = has_extent ? static_cast<int>((r - x1min) * inv_dr) : 0;
@@ -889,7 +910,7 @@ void UpdateMagicHeatingProfile(Mesh *mesh, Real time, Real dt) {
           const Real pressure = prim(IPR, k, j, i);
           const Real temperature = ComputeCellTemperature(rho, pressure, *units);
           const Real err = temperature - g_magic_target_temperature;
-          const Real cell_volume = coord->GetCellVolume(k, j, i);
+          const Real cell_volume = outer_taper * coord->GetCellVolume(k, j, i);
           sum[static_cast<std::size_t>(idx)] += err * cell_volume;
           volume[static_cast<std::size_t>(idx)] += cell_volume;
         }
@@ -958,20 +979,22 @@ Real HistoryMagicHeatingRate(MeshBlock *pmb, int iout) {
 
   Coordinates *pcoord = pmb->pcoord;
   AthenaArray<Real> &cons = pmb->phydro->u;
+  const Real outer_radius_code = pmb->pmy_mesh->mesh_size.x1max;
 
   Real heating_rate = 0.0;
   for (int k = pmb->ks; k <= pmb->ke; ++k) {
     for (int j = pmb->js; j <= pmb->je; ++j) {
       for (int i = pmb->is; i <= pmb->ie; ++i) {
         const Real radius_code = CellCenterRadiusCode(pcoord, k, j, i);
-        if (InOuterBufferHalo(radius_code)) {
+        const Real outer_taper = OuterBufferHeatCoolTaper(radius_code, outer_radius_code);
+        if (outer_taper <= 0.0) {
           continue;
         }
         const Real err = SampleMagicHeatingError(radius_code);
         if (err == 0.0) {
           continue;
         }
-        const Real taper = MagicHeatingTaper(radius_code);
+        const Real taper = outer_taper * MagicHeatingTaper(radius_code);
         if (taper <= 0.0) {
           continue;
         }
@@ -2534,6 +2557,7 @@ void PrecipitatorGravity(MeshBlock *pmb, const Real time, const Real dt,
     }
   }
   Coordinates *pcoord = pmb->pcoord;
+  const Real outer_radius_code = pmb->pmy_mesh->mesh_size.x1max;
   if (heating_enabled) {
     UpdateMagicHeatingProfile(pmb->pmy_mesh, time, dt);
   }
@@ -2579,8 +2603,10 @@ void PrecipitatorGravity(MeshBlock *pmb, const Real time, const Real dt,
           }
         }
 
-        if (cooling_enabled && !InOuterBufferHalo(radius_code)) {
-          const Real cooling_taper = MagicHeatingTaper(radius_code);
+        if (cooling_enabled) {
+          const Real cooling_taper =
+              OuterBufferHeatCoolTaper(radius_code, outer_radius_code) *
+              MagicHeatingTaper(radius_code);
           if (cooling_taper > 0.0) {
             // Use the same altitude taper as magic heating.
             const Real thermal_energy = std::max(thermal_eint, 0.0);
@@ -2598,10 +2624,12 @@ void PrecipitatorGravity(MeshBlock *pmb, const Real time, const Real dt,
           }
         }
 
-        if (heating_enabled && g_magic_profile_ready && !InOuterBufferHalo(radius_code)) {
+        if (heating_enabled && g_magic_profile_ready) {
           const Real err = SampleMagicHeatingError(radius_code);
           if (err != 0.0) {
-            const Real taper = MagicHeatingTaper(radius_code);
+            const Real taper =
+                OuterBufferHeatCoolTaper(radius_code, outer_radius_code) *
+                MagicHeatingTaper(radius_code);
             if (taper > 0.0) {
               const Real rho_bg = SampleBackgroundDensityCode(radius_code, units);
               const Real pressure_bg = SampleBackgroundPressureCode(radius_code, units);
