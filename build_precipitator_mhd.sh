@@ -184,7 +184,7 @@ find_openpmd_lib() {
 }
 
 HDF5_PREFIX="$(detect_hdf5_prefix || true)"
-CONFIGURE_ARGS=(-hdf5 --prob precipitator --flux hlld --coord spherical_polar -mpi -b --nghost=3)
+CONFIGURE_ARGS=(-hdf5 --prob precipitator --flux hlld --coord cartesian -mpi -b --nghost=3)
 if [[ "${ENABLE_OPENPMD}" == "1" ]]; then
   CONFIGURE_ARGS=(-openpmd --openpmd_path "${OPENPMD_PREFIX}" "${CONFIGURE_ARGS[@]}")
   echo "### openPMD support enabled (ENABLE_OPENPMD=1)"
