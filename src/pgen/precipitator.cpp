@@ -17,26 +17,26 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
-#include <cstring>
-#include <limits>
 
 // Athena++ headers
 #include "../athena.hpp"
 #include "../athena_arrays.hpp"
+#include "../bvals/bvals.hpp"
 #include "../coordinates/coordinates.hpp"
 #include "../eos/eos.hpp"
 #include "../field/field.hpp"
 #include "../hydro/hydro.hpp"
 #include "../mesh/mesh.hpp"
-#include "../bvals/bvals.hpp"
 #include "../parameter_input.hpp"
 #include "../units/units.hpp"
 
@@ -143,7 +143,7 @@ Real g_magic_profile_dt = std::numeric_limits<Real>::quiet_NaN();
 bool g_magic_profile_ready = false;
 std::vector<Real> g_magic_error_profile;
 
-std::string g_force_free_param_file;
+std::string g_force_free_param_file;  // NOLINT(runtime/string)
 bool g_force_free_loaded = false;
 Real g_force_free_alpha = 0.0;
 Real g_force_free_amplitude = 1.0;
@@ -183,6 +183,10 @@ Real g_outer_buffer_match_enthalpy_cgs = 0.0;
 
 constexpr const char *kDensityContrastName = "delta_rho_over_rho_bar";
 constexpr const char *kTemperatureOutputName = "temperature_K";
+int g_radial_profile_bins = 0;
+Real g_radial_profile_rmin = 0.0;
+Real g_radial_profile_rmax = 0.0;
+Real g_radial_profile_inv_dr = 0.0;
 std::vector<Real> g_radial_density_profile;
 std::vector<Real> g_radial_pressure_profile;
 std::vector<Real> g_radial_entropy_profile;
@@ -200,20 +204,189 @@ void ApplyOuterSponge(MeshBlock *pmb);
 Real ComputeCellTemperature(Real rho_code, Real pressure_code, const Units &units);
 Real HistoryMagicHeatingRate(MeshBlock *pmb, int iout);
 Real CellCenterRadiusCode(const Coordinates *coord, int k, int j, int i);
+Real NominalOuterRadiusCode(const RegionSize &size);
+Real RadialProfileMaxCode(const RegionSize &size);
 bool InOuterBufferHalo(Real radius_code);
 Real OuterBufferHeatCoolTaper(Real radius_code, Real outer_radius_code);
 
-std::int64_t ComputeGlobalX1Offset(const MeshBlock &pmb, int nx1_total) {
-  const std::int64_t cell_count = static_cast<std::int64_t>(pmb.block_size.nx1);
-  const std::int64_t base_index = static_cast<std::int64_t>(pmb.loc.lx1) * cell_count;
-  const std::int64_t end_index = base_index + cell_count;
-  if (base_index < 0 || end_index > static_cast<std::int64_t>(nx1_total)) {
-    std::stringstream msg;
-    msg << "### FATAL ERROR in precipitator.cpp" << std::endl
-        << "Invalid radial index mapping for density contrast output.";
-    ATHENA_ERROR(msg);
+struct CartesianPoint {
+  Real x;
+  Real y;
+  Real z;
+};
+
+struct SphericalPoint {
+  Real r;
+  Real theta;
+  Real phi;
+  Real rhat_x;
+  Real rhat_y;
+  Real rhat_z;
+};
+
+bool UsingCartesianCoordinates() {
+#if defined(COORDINATE_SYSTEM)
+  return std::strcmp(COORDINATE_SYSTEM, "cartesian") == 0;
+#else
+  return false;
+#endif
+}
+
+bool UsingSphericalPolarCoordinates() {
+#if defined(COORDINATE_SYSTEM)
+  return std::strcmp(COORDINATE_SYSTEM, "spherical_polar") == 0;
+#else
+  return false;
+#endif
+}
+
+Real CellCenteredCoord2(const Coordinates *coord, int j) {
+  return coord->x2v(j);
+}
+
+Real CellCenteredCoord3(const Coordinates *coord, int k) {
+  return coord->x3v(k);
+}
+
+CartesianPoint MeshCoordinatesToCartesian(Real x1, Real x2, Real x3) {
+  if (UsingCartesianCoordinates()) {
+    return {x1, x2, x3};
   }
-  return base_index;
+  if (UsingSphericalPolarCoordinates()) {
+    const Real sin_theta = std::sin(x2);
+    return {x1 * sin_theta * std::cos(x3), x1 * sin_theta * std::sin(x3),
+            x1 * std::cos(x2)};
+  }
+  return {x1, x2, x3};
+}
+
+CartesianPoint CellCenterPosition(const Coordinates *coord, int k, int j, int i) {
+  return MeshCoordinatesToCartesian(coord->x1v(i), CellCenteredCoord2(coord, j),
+                                    CellCenteredCoord3(coord, k));
+}
+
+CartesianPoint Face1CenterPosition(const Coordinates *coord, int k, int j, int i) {
+  return MeshCoordinatesToCartesian(coord->x1f(i), CellCenteredCoord2(coord, j),
+                                    CellCenteredCoord3(coord, k));
+}
+
+CartesianPoint Face2CenterPosition(const Coordinates *coord, int k, int j, int i) {
+  return MeshCoordinatesToCartesian(coord->x1v(i), coord->x2f(j),
+                                    CellCenteredCoord3(coord, k));
+}
+
+CartesianPoint Face3CenterPosition(const Coordinates *coord, int k, int j, int i) {
+  return MeshCoordinatesToCartesian(coord->x1v(i), CellCenteredCoord2(coord, j),
+                                    coord->x3f(k));
+}
+
+CartesianPoint Edge1Position(const Coordinates *coord, int k, int j, int i) {
+  return MeshCoordinatesToCartesian(coord->x1v(i), coord->x2f(j), coord->x3f(k));
+}
+
+CartesianPoint Edge2Position(const Coordinates *coord, int k, int j, int i) {
+  return MeshCoordinatesToCartesian(coord->x1f(i), CellCenteredCoord2(coord, j),
+                                    coord->x3f(k));
+}
+
+CartesianPoint Edge3Position(const Coordinates *coord, int k, int j, int i) {
+  return MeshCoordinatesToCartesian(coord->x1f(i), coord->x2f(j),
+                                    CellCenteredCoord3(coord, k));
+}
+
+SphericalPoint CartesianToSpherical(const CartesianPoint &pos) {
+  const Real r = std::sqrt(SQR(pos.x) + SQR(pos.y) + SQR(pos.z));
+  if (!(r > 0.0)) {
+    return {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  }
+  const Real cos_theta = std::max(static_cast<Real>(-1.0),
+                                  std::min(static_cast<Real>(1.0), pos.z / r));
+  Real phi = std::atan2(pos.y, pos.x);
+  if (phi < 0.0) {
+    phi += 2.0 * PI;
+  }
+  return {r, std::acos(cos_theta), phi, pos.x / r, pos.y / r, pos.z / r};
+}
+
+SphericalPoint CellCenterSpherical(const Coordinates *coord, int k, int j, int i) {
+  return CartesianToSpherical(CellCenterPosition(coord, k, j, i));
+}
+
+Real MaxAbsBound(Real a, Real b) {
+  return std::max(std::abs(a), std::abs(b));
+}
+
+Real NominalOuterRadiusCode(const RegionSize &size) {
+  if (!UsingCartesianCoordinates()) {
+    return size.x1max;
+  }
+
+  Real r_outer = MaxAbsBound(size.x1min, size.x1max);
+  if (size.nx2 > 1) {
+    r_outer = std::min(r_outer, MaxAbsBound(size.x2min, size.x2max));
+  }
+  if (size.nx3 > 1) {
+    r_outer = std::min(r_outer, MaxAbsBound(size.x3min, size.x3max));
+  }
+  return r_outer;
+}
+
+Real RadialProfileMaxCode(const RegionSize &size) {
+  if (!UsingCartesianCoordinates()) {
+    return size.x1max;
+  }
+
+  const Real rx = MaxAbsBound(size.x1min, size.x1max);
+  const Real ry = (size.nx2 > 1) ? MaxAbsBound(size.x2min, size.x2max) : 0.0;
+  const Real rz = (size.nx3 > 1) ? MaxAbsBound(size.x3min, size.x3max) : 0.0;
+  return std::sqrt(SQR(rx) + SQR(ry) + SQR(rz));
+}
+
+Real RadialProfileMinCode(const RegionSize &size) {
+  if (UsingCartesianCoordinates()) {
+    return 0.0;
+  }
+  return size.x1min;
+}
+
+int RadialProfileBinCount(const RegionSize &size) {
+  return std::max(size.nx1, 1);
+}
+
+int ClampRadialBinIndex(int num_bins, Real radius, Real rmin, Real inv_dr) {
+  if (num_bins <= 1 || inv_dr == 0.0) {
+    return 0;
+  }
+  int idx = static_cast<int>((radius - rmin) * inv_dr);
+  if (idx < 0) {
+    idx = 0;
+  }
+  if (idx >= num_bins) {
+    idx = num_bins - 1;
+  }
+  return idx;
+}
+
+Real SampleRadialProfile(const std::vector<Real> &profile, Real radius) {
+  if (!g_radial_density_ready || profile.empty()) {
+    return 0.0;
+  }
+  if (g_radial_profile_bins <= 1 || g_radial_profile_inv_dr == 0.0) {
+    return profile.front();
+  }
+  Real idx_f = (radius - g_radial_profile_rmin) * g_radial_profile_inv_dr;
+  if (idx_f <= 0.0) {
+    return profile.front();
+  }
+  const Real max_index = static_cast<Real>(g_radial_profile_bins - 1);
+  if (idx_f >= max_index) {
+    return profile.back();
+  }
+  const int idx = static_cast<int>(idx_f);
+  const Real frac = idx_f - static_cast<Real>(idx);
+  const Real a = profile[static_cast<std::size_t>(idx)];
+  const Real b = profile[static_cast<std::size_t>(idx + 1)];
+  return a + frac * (b - a);
 }
 
 void ComputeRadialProfiles(Mesh *mesh) {
@@ -227,8 +400,8 @@ void ComputeRadialProfiles(Mesh *mesh) {
     ATHENA_ERROR(msg);
   }
 
-  const int nx1_total = mesh->mesh_size.nx1;
-  if (nx1_total <= 0) {
+  const int num_bins = RadialProfileBinCount(mesh->mesh_size);
+  if (num_bins <= 0) {
     g_radial_density_profile.clear();
     g_radial_pressure_profile.clear();
     g_radial_entropy_profile.clear();
@@ -236,6 +409,10 @@ void ComputeRadialProfiles(Mesh *mesh) {
     g_radial_v1_profile.clear();
     g_radial_v2_profile.clear();
     g_radial_v3_profile.clear();
+    g_radial_profile_bins = 0;
+    g_radial_profile_rmin = 0.0;
+    g_radial_profile_rmax = 0.0;
+    g_radial_profile_inv_dr = 0.0;
     g_radial_density_ready = false;
     return;
   }
@@ -252,7 +429,12 @@ void ComputeRadialProfiles(Mesh *mesh) {
   (void)units;
 #endif
 
-  const std::size_t vec_size = static_cast<std::size_t>(nx1_total);
+  const Real rmin = RadialProfileMinCode(mesh->mesh_size);
+  const Real rmax = RadialProfileMaxCode(mesh->mesh_size);
+  const bool has_extent = (num_bins > 1) && (rmax > rmin);
+  const Real inv_dr = has_extent ? static_cast<Real>(num_bins) / (rmax - rmin) : 0.0;
+
+  const std::size_t vec_size = static_cast<std::size_t>(num_bins);
   std::vector<Real> rho_sum(vec_size, 0.0);
 #if NON_BAROTROPIC_EOS
   std::vector<Real> pressure_sum(vec_size, 0.0);
@@ -271,14 +453,13 @@ void ComputeRadialProfiles(Mesh *mesh) {
     }
     Coordinates *coord = pmb->pcoord;
     auto &prim = pmb->phydro->w;
-    const int i_offset = pmb->is;
-    const std::int64_t base_index = ComputeGlobalX1Offset(*pmb, nx1_total);
 
-    for (int i = pmb->is; i <= pmb->ie; ++i) {
-      const std::int64_t global_i = base_index + static_cast<std::int64_t>(i - i_offset);
-      const std::size_t idx = static_cast<std::size_t>(global_i);
-      for (int k = pmb->ks; k <= pmb->ke; ++k) {
-        for (int j = pmb->js; j <= pmb->je; ++j) {
+    for (int k = pmb->ks; k <= pmb->ke; ++k) {
+      for (int j = pmb->js; j <= pmb->je; ++j) {
+        for (int i = pmb->is; i <= pmb->ie; ++i) {
+          const Real radius = CellCenterRadiusCode(coord, k, j, i);
+          const std::size_t idx = static_cast<std::size_t>(
+              ClampRadialBinIndex(num_bins, radius, rmin, inv_dr));
           const Real cell_volume = coord->GetCellVolume(k, j, i);
           const Real rho = prim(IDN, k, j, i);
           rho_sum[idx] += rho * cell_volume;
@@ -306,23 +487,23 @@ void ComputeRadialProfiles(Mesh *mesh) {
   }
 
 #ifdef MPI_PARALLEL
-  MPI_Allreduce(MPI_IN_PLACE, rho_sum.data(), nx1_total, MPI_ATHENA_REAL, MPI_SUM,
+  MPI_Allreduce(MPI_IN_PLACE, rho_sum.data(), num_bins, MPI_ATHENA_REAL, MPI_SUM,
                 MPI_COMM_WORLD);
 #if NON_BAROTROPIC_EOS
-  MPI_Allreduce(MPI_IN_PLACE, pressure_sum.data(), nx1_total, MPI_ATHENA_REAL, MPI_SUM,
+  MPI_Allreduce(MPI_IN_PLACE, pressure_sum.data(), num_bins, MPI_ATHENA_REAL, MPI_SUM,
                 MPI_COMM_WORLD);
-  MPI_Allreduce(MPI_IN_PLACE, entropy_sum.data(), nx1_total, MPI_ATHENA_REAL, MPI_SUM,
+  MPI_Allreduce(MPI_IN_PLACE, entropy_sum.data(), num_bins, MPI_ATHENA_REAL, MPI_SUM,
                 MPI_COMM_WORLD);
-  MPI_Allreduce(MPI_IN_PLACE, temperature_sum.data(), nx1_total, MPI_ATHENA_REAL,
+  MPI_Allreduce(MPI_IN_PLACE, temperature_sum.data(), num_bins, MPI_ATHENA_REAL,
                 MPI_SUM, MPI_COMM_WORLD);
 #endif
-  MPI_Allreduce(MPI_IN_PLACE, v1_sum.data(), nx1_total, MPI_ATHENA_REAL, MPI_SUM,
+  MPI_Allreduce(MPI_IN_PLACE, v1_sum.data(), num_bins, MPI_ATHENA_REAL, MPI_SUM,
                 MPI_COMM_WORLD);
-  MPI_Allreduce(MPI_IN_PLACE, v2_sum.data(), nx1_total, MPI_ATHENA_REAL, MPI_SUM,
+  MPI_Allreduce(MPI_IN_PLACE, v2_sum.data(), num_bins, MPI_ATHENA_REAL, MPI_SUM,
                 MPI_COMM_WORLD);
-  MPI_Allreduce(MPI_IN_PLACE, v3_sum.data(), nx1_total, MPI_ATHENA_REAL, MPI_SUM,
+  MPI_Allreduce(MPI_IN_PLACE, v3_sum.data(), num_bins, MPI_ATHENA_REAL, MPI_SUM,
                 MPI_COMM_WORLD);
-  MPI_Allreduce(MPI_IN_PLACE, volume.data(), nx1_total, MPI_ATHENA_REAL, MPI_SUM,
+  MPI_Allreduce(MPI_IN_PLACE, volume.data(), num_bins, MPI_ATHENA_REAL, MPI_SUM,
                 MPI_COMM_WORLD);
 #endif
 
@@ -336,7 +517,7 @@ void ComputeRadialProfiles(Mesh *mesh) {
   g_radial_v2_profile.assign(vec_size, 0.0);
   g_radial_v3_profile.assign(vec_size, 0.0);
 
-  for (int i = 0; i < nx1_total; ++i) {
+  for (int i = 0; i < num_bins; ++i) {
     const std::size_t idx = static_cast<std::size_t>(i);
     if (volume[idx] > 0.0) {
       g_radial_density_profile[idx] = rho_sum[idx] / volume[idx];
@@ -361,6 +542,10 @@ void ComputeRadialProfiles(Mesh *mesh) {
     }
   }
 
+  g_radial_profile_bins = num_bins;
+  g_radial_profile_rmin = rmin;
+  g_radial_profile_rmax = rmax;
+  g_radial_profile_inv_dr = has_extent ? inv_dr : 0.0;
   g_radial_density_ready = true;
   g_radial_density_time = mesh->time;
   g_radial_density_cycle = mesh->ncycle;
@@ -372,7 +557,8 @@ const std::vector<Real> &GetRadiallyAveragedDensity(Mesh *mesh) {
     return kEmptyProfile;
   }
   const bool size_changed =
-      static_cast<int>(g_radial_density_profile.size()) != mesh->mesh_size.nx1;
+      static_cast<int>(g_radial_density_profile.size()) !=
+      RadialProfileBinCount(mesh->mesh_size);
   if (!g_radial_density_ready || size_changed || g_radial_density_cycle != mesh->ncycle
       || g_radial_density_time != mesh->time) {
     ComputeRadialProfiles(mesh);
@@ -387,7 +573,8 @@ const std::vector<Real> &GetRadiallyAveragedPressure(Mesh *mesh) {
     return kEmptyProfile;
   }
   const bool size_changed =
-      static_cast<int>(g_radial_pressure_profile.size()) != mesh->mesh_size.nx1;
+      static_cast<int>(g_radial_pressure_profile.size()) !=
+      RadialProfileBinCount(mesh->mesh_size);
   if (!g_radial_density_ready || size_changed || g_radial_density_cycle != mesh->ncycle
       || g_radial_density_time != mesh->time) {
     ComputeRadialProfiles(mesh);
@@ -401,7 +588,8 @@ const std::vector<Real> &GetRadiallyAveragedEntropy(Mesh *mesh) {
     return kEmptyProfile;
   }
   const bool size_changed =
-      static_cast<int>(g_radial_entropy_profile.size()) != mesh->mesh_size.nx1;
+      static_cast<int>(g_radial_entropy_profile.size()) !=
+      RadialProfileBinCount(mesh->mesh_size);
   if (!g_radial_density_ready || size_changed || g_radial_density_cycle != mesh->ncycle
       || g_radial_density_time != mesh->time) {
     ComputeRadialProfiles(mesh);
@@ -415,7 +603,8 @@ const std::vector<Real> &GetRadiallyAveragedTemperature(Mesh *mesh) {
     return kEmptyProfile;
   }
   const bool size_changed =
-      static_cast<int>(g_radial_temperature_profile.size()) != mesh->mesh_size.nx1;
+      static_cast<int>(g_radial_temperature_profile.size()) !=
+      RadialProfileBinCount(mesh->mesh_size);
   if (!g_radial_density_ready || size_changed || g_radial_density_cycle != mesh->ncycle
       || g_radial_density_time != mesh->time) {
     ComputeRadialProfiles(mesh);
@@ -430,7 +619,8 @@ const std::vector<Real> &GetRadiallyAveragedV1(Mesh *mesh) {
     return kEmptyProfile;
   }
   const bool size_changed =
-      static_cast<int>(g_radial_v1_profile.size()) != mesh->mesh_size.nx1;
+      static_cast<int>(g_radial_v1_profile.size()) !=
+      RadialProfileBinCount(mesh->mesh_size);
   if (!g_radial_density_ready || size_changed || g_radial_density_cycle != mesh->ncycle
       || g_radial_density_time != mesh->time) {
     ComputeRadialProfiles(mesh);
@@ -444,7 +634,8 @@ const std::vector<Real> &GetRadiallyAveragedV2(Mesh *mesh) {
     return kEmptyProfile;
   }
   const bool size_changed =
-      static_cast<int>(g_radial_v2_profile.size()) != mesh->mesh_size.nx1;
+      static_cast<int>(g_radial_v2_profile.size()) !=
+      RadialProfileBinCount(mesh->mesh_size);
   if (!g_radial_density_ready || size_changed || g_radial_density_cycle != mesh->ncycle
       || g_radial_density_time != mesh->time) {
     ComputeRadialProfiles(mesh);
@@ -458,7 +649,8 @@ const std::vector<Real> &GetRadiallyAveragedV3(Mesh *mesh) {
     return kEmptyProfile;
   }
   const bool size_changed =
-      static_cast<int>(g_radial_v3_profile.size()) != mesh->mesh_size.nx1;
+      static_cast<int>(g_radial_v3_profile.size()) !=
+      RadialProfileBinCount(mesh->mesh_size);
   if (!g_radial_density_ready || size_changed || g_radial_density_cycle != mesh->ncycle
       || g_radial_density_time != mesh->time) {
     ComputeRadialProfiles(mesh);
@@ -481,7 +673,8 @@ constexpr std::array<Real, 7> kGaussWeights = {
      0.12948496616886969327}};
 
 template <typename Func>
-Real AverageProfile(const Func &func, Real a, Real b, const PrecipitatorProfile &profile) {
+Real AverageProfile(const Func &func, Real a, Real b,
+                    const PrecipitatorProfile &profile) {
   if (b <= a) {
     const Real clamped = std::min(std::max(a, profile.MinRadius()), profile.MaxRadius());
     return func(clamped);
@@ -504,12 +697,25 @@ Real CodeRadiusToCgs(Real radius_code, const Units *units) {
   return radius_code * units->code_length_cgs;
 }
 
-Real PotentialInCodeUnits(Real coord_value, const Units *units) {
+Real PotentialInCodeUnits(Real radius_code, const Units *units) {
   const Real length_cgs = units->code_length_cgs;
   const Real time_cgs = units->code_time_cgs;
   const Real code_potential_cgs = (length_cgs / (time_cgs * time_cgs)) * length_cgs;
-  const Real r_cgs = coord_value * length_cgs;
+  const Real r_cgs = radius_code * length_cgs;
   return g_profile->Phi(r_cgs) / code_potential_cgs;
+}
+
+Real GravityInCodeUnits(Real radius_code, const Units *units) {
+  if (!g_profile || units == nullptr) {
+    return 0.0;
+  }
+  const Real code_accel_cgs =
+      units->code_length_cgs / (units->code_time_cgs * units->code_time_cgs);
+  if (!(code_accel_cgs > 0.0)) {
+    return 0.0;
+  }
+  const Real r_cgs = CodeRadiusToCgs(radius_code, units);
+  return g_profile->Gravity(r_cgs) / code_accel_cgs;
 }
 
 Real SampleBackgroundRadiusCgs(Real radius_code, const Units *units) {
@@ -572,8 +778,8 @@ Real SolveOuterBufferEnthalpyCgs(Real radius_cgs) {
   const Real dr_total = radius_cgs - g_outer_buffer_inner_radius_cgs;
   const Real dr_limit =
       0.01 * std::max(g_outer_buffer_inner_radius_cgs, TINY_NUMBER);
-  const int nsteps =
-      std::max(1, static_cast<int>(std::ceil(dr_total / std::max(dr_limit, TINY_NUMBER))));
+  const int nsteps = std::max(
+      1, static_cast<int>(std::ceil(dr_total / std::max(dr_limit, TINY_NUMBER))));
   const Real dr = dr_total / static_cast<Real>(nsteps);
 
   Real r = g_outer_buffer_inner_radius_cgs;
@@ -672,6 +878,9 @@ void ApplyInnerSponge(MeshBlock *pmb) {
   if (!g_profile || g_inner_sponge_tau <= 0.0) {
     return;
   }
+  if (UsingCartesianCoordinates()) {
+    return;
+  }
   Mesh *mesh = pmb->pmy_mesh;
   if (mesh == nullptr) {
     return;
@@ -703,14 +912,13 @@ void ApplyInnerSponge(MeshBlock *pmb) {
   const int ke = pmb->ke;
 
   bool modified = false;
-  int damp_hi = is - 1;
 
   for (int k = ks; k <= ke; ++k) {
     for (int j = js; j <= je; ++j) {
       for (int i = is; i <= ie; ++i) {
-        const Real radius_code = pcoord->x1v(i);
+        const Real radius_code = CellCenterRadiusCode(pcoord, k, j, i);
         if (radius_code >= r_limit) {
-          break;
+          continue;
         }
         Real radial_weight = (r_limit - radius_code) * inv_extent;
         radial_weight = std::max(static_cast<Real>(0.0),
@@ -727,9 +935,6 @@ void ApplyInnerSponge(MeshBlock *pmb) {
         prim(IVY, k, j, i) *= (1.0 - alpha);
         prim(IVZ, k, j, i) *= (1.0 - alpha);
         modified = true;
-        if (i > damp_hi) {
-          damp_hi = i;
-        }
       }
     }
   }
@@ -743,8 +948,7 @@ void ApplyInnerSponge(MeshBlock *pmb) {
 #else
   AthenaArray<Real> &bcc = prim; // placeholder, bc not used in hydro builds
 #endif
-  pmb->peos->PrimitiveToConserved(prim, bcc, cons, pcoord,
-                                  is, damp_hi, js, je, ks, ke);
+  pmb->peos->PrimitiveToConserved(prim, bcc, cons, pcoord, is, ie, js, je, ks, ke);
 }
 
 void ApplyOuterSponge(MeshBlock *pmb) {
@@ -767,7 +971,7 @@ void ApplyOuterSponge(MeshBlock *pmb) {
   }
 
   const Real r_start = g_outer_sponge_inner_radius;
-  const Real r_outer = mesh->mesh_size.x1max;
+  const Real r_outer = NominalOuterRadiusCode(mesh->mesh_size);
   if (!(r_outer > r_start)) {
     return;
   }
@@ -785,12 +989,11 @@ void ApplyOuterSponge(MeshBlock *pmb) {
   const int ke = pmb->ke;
 
   bool modified = false;
-  int damp_lo = ie + 1;
 
   for (int k = ks; k <= ke; ++k) {
     for (int j = js; j <= je; ++j) {
       for (int i = is; i <= ie; ++i) {
-        const Real radius_code = pcoord->x1v(i);
+        const Real radius_code = CellCenterRadiusCode(pcoord, k, j, i);
         if (radius_code <= r_start) {
           continue;
         }
@@ -809,9 +1012,6 @@ void ApplyOuterSponge(MeshBlock *pmb) {
         prim(IVY, k, j, i) *= (1.0 - alpha);
         prim(IVZ, k, j, i) *= (1.0 - alpha);
         modified = true;
-        if (i < damp_lo) {
-          damp_lo = i;
-        }
       }
     }
   }
@@ -825,8 +1025,7 @@ void ApplyOuterSponge(MeshBlock *pmb) {
 #else
   AthenaArray<Real> &bcc = prim; // placeholder, bc not used in hydro builds
 #endif
-  pmb->peos->PrimitiveToConserved(prim, bcc, cons, pcoord,
-                                  damp_lo, ie, js, je, ks, ke);
+  pmb->peos->PrimitiveToConserved(prim, bcc, cons, pcoord, is, ie, js, je, ks, ke);
 }
 
 Real ComputeCellTemperature(Real rho_code, Real pressure_code, const Units &units) {
@@ -877,12 +1076,12 @@ void UpdateMagicHeatingProfile(Mesh *mesh, Real time, Real dt) {
   std::vector<Real> sum(static_cast<std::size_t>(num_bins), 0.0);
   std::vector<Real> volume(static_cast<std::size_t>(num_bins), 0.0);
 
-  const Real x1min = mesh->mesh_size.x1min;
-  const Real x1max = mesh->mesh_size.x1max;
-  const Real extent = x1max - x1min;
+  const Real rmin = RadialProfileMinCode(mesh->mesh_size);
+  const Real rmax = RadialProfileMaxCode(mesh->mesh_size);
+  const Real extent = rmax - rmin;
   const bool has_extent = (num_bins > 1) && (extent > 0.0);
   const Real inv_dr = has_extent ? static_cast<Real>(num_bins) / extent : 0.0;
-  const Real outer_radius_code = mesh->mesh_size.x1max;
+  const Real outer_radius_code = NominalOuterRadiusCode(mesh->mesh_size);
 
   for (int block = 0; block < mesh->nblocal; ++block) {
     MeshBlock *pmb = mesh->my_blocks(block);
@@ -899,13 +1098,7 @@ void UpdateMagicHeatingProfile(Mesh *mesh, Real time, Real dt) {
           if (outer_taper <= 0.0) {
             continue;
           }
-          int idx = has_extent ? static_cast<int>((r - x1min) * inv_dr) : 0;
-          if (idx < 0) {
-            idx = 0;
-          }
-          if (idx >= num_bins) {
-            idx = num_bins - 1;
-          }
+          const int idx = ClampRadialBinIndex(num_bins, r, rmin, inv_dr);
           const Real rho = prim(IDN, k, j, i);
           const Real pressure = prim(IPR, k, j, i);
           const Real temperature = ComputeCellTemperature(rho, pressure, *units);
@@ -937,18 +1130,18 @@ void UpdateMagicHeatingProfile(Mesh *mesh, Real time, Real dt) {
   g_magic_profile_ready = true;
   g_magic_profile_time = time;
   g_magic_profile_dt = dt;
-  g_magic_profile_x1min = x1min;
+  g_magic_profile_x1min = rmin;
   g_magic_profile_inv_dr = has_extent ? inv_dr : 0.0;
 }
 
-Real SampleMagicHeatingError(Real coord_value) {
+Real SampleMagicHeatingError(Real radius) {
   if (!g_magic_profile_ready || g_magic_error_profile.empty()) {
     return 0.0;
   }
   if (g_magic_profile_bins <= 1 || g_magic_profile_inv_dr == 0.0) {
     return g_magic_error_profile.front();
   }
-  Real idx_f = (coord_value - g_magic_profile_x1min) * g_magic_profile_inv_dr;
+  Real idx_f = (radius - g_magic_profile_x1min) * g_magic_profile_inv_dr;
   if (idx_f <= 0.0) {
     return g_magic_error_profile.front();
   }
@@ -979,7 +1172,7 @@ Real HistoryMagicHeatingRate(MeshBlock *pmb, int iout) {
 
   Coordinates *pcoord = pmb->pcoord;
   AthenaArray<Real> &cons = pmb->phydro->u;
-  const Real outer_radius_code = pmb->pmy_mesh->mesh_size.x1max;
+  const Real outer_radius_code = NominalOuterRadiusCode(pmb->pmy_mesh->mesh_size);
 
   Real heating_rate = 0.0;
   for (int k = pmb->ks; k <= pmb->ke; ++k) {
@@ -1194,9 +1387,24 @@ Real ForceFreeVectorPotentialPhi(Real r, Real theta) {
   return S * std::sin(theta);
 }
 
-void InitializeForceFreeField(MeshBlock *pmb) {
-#if MAGNETIC_FIELDS_ENABLED
-  LoadForceFreeParameters();
+void ForceFreeVectorPotentialCartesian(const CartesianPoint &pos, Real *a1, Real *a2,
+                                       Real *a3) {
+  const Real r = std::sqrt(SQR(pos.x) + SQR(pos.y) + SQR(pos.z));
+  Real s_over_r = 0.0;
+  ForceFreeRadialTerms(r, nullptr, &s_over_r, nullptr);
+  const Real alpha_z = g_force_free_alpha * pos.z;
+  if (a1 != nullptr) {
+    *a1 = s_over_r * (alpha_z * pos.x - pos.y);
+  }
+  if (a2 != nullptr) {
+    *a2 = s_over_r * (alpha_z * pos.y + pos.x);
+  }
+  if (a3 != nullptr) {
+    *a3 = s_over_r * (alpha_z * pos.z);
+  }
+}
+
+void InitializeForceFreeFieldSpherical(MeshBlock *pmb) {
   auto *pcoord = pmb->pcoord;
   auto *pbval = pmb->pbval;
   auto &b = pmb->pfield->b;
@@ -1212,10 +1420,8 @@ void InitializeForceFreeField(MeshBlock *pmb) {
   for (int k = pmb->ks; k <= pmb->ke + 1; ++k) {
     for (int j = pmb->js; j <= pmb->je + 1; ++j) {
       for (int i = pmb->is; i <= pmb->ie + 1; ++i) {
-        a1(k, j, i) =
-            ForceFreeVectorPotentialR(pcoord->x1v(i), pcoord->x2f(j));
-        a3(k, j, i) =
-            ForceFreeVectorPotentialPhi(pcoord->x1f(i), pcoord->x2f(j));
+        a1(k, j, i) = ForceFreeVectorPotentialR(pcoord->x1v(i), pcoord->x2f(j));
+        a3(k, j, i) = ForceFreeVectorPotentialPhi(pcoord->x1f(i), pcoord->x2f(j));
       }
     }
   }
@@ -1322,9 +1528,76 @@ void InitializeForceFreeField(MeshBlock *pmb) {
       }
     }
   }
+}
 
-  a1.DeleteAthenaArray();
-  a3.DeleteAthenaArray();
+void InitializeForceFreeFieldCartesian(MeshBlock *pmb) {
+  auto *pcoord = pmb->pcoord;
+  auto &b = pmb->pfield->b;
+
+  const int nx1 = pmb->block_size.nx1 + 2 * NGHOST + 1;
+  const int nx2 = pmb->block_size.nx2 + 2 * NGHOST + 1;
+  const int nx3 = pmb->block_size.nx3 + 2 * NGHOST + 1;
+
+  AthenaArray<Real> a1, a2, a3;
+  a1.NewAthenaArray(nx3, nx2, nx1);
+  a2.NewAthenaArray(nx3, nx2, nx1);
+  a3.NewAthenaArray(nx3, nx2, nx1);
+
+  for (int k = pmb->ks; k <= pmb->ke + 1; ++k) {
+    for (int j = pmb->js; j <= pmb->je + 1; ++j) {
+      for (int i = pmb->is; i <= pmb->ie + 1; ++i) {
+        if (i != pmb->ie + 1) {
+          const CartesianPoint pos = Edge1Position(pcoord, k, j, i);
+          ForceFreeVectorPotentialCartesian(pos, &a1(k, j, i), nullptr, nullptr);
+        }
+        if (j != pmb->je + 1) {
+          const CartesianPoint pos = Edge2Position(pcoord, k, j, i);
+          ForceFreeVectorPotentialCartesian(pos, nullptr, &a2(k, j, i), nullptr);
+        }
+        if (k != pmb->ke + 1) {
+          const CartesianPoint pos = Edge3Position(pcoord, k, j, i);
+          ForceFreeVectorPotentialCartesian(pos, nullptr, nullptr, &a3(k, j, i));
+        }
+      }
+    }
+  }
+
+  for (int k = pmb->ks; k <= pmb->ke; ++k) {
+    for (int j = pmb->js; j <= pmb->je; ++j) {
+      for (int i = pmb->is; i <= pmb->ie + 1; ++i) {
+        b.x1f(k, j, i) = (a3(k, j + 1, i) - a3(k, j, i)) / pcoord->dx2f(j) -
+                         (a2(k + 1, j, i) - a2(k, j, i)) / pcoord->dx3f(k);
+      }
+    }
+  }
+
+  for (int k = pmb->ks; k <= pmb->ke; ++k) {
+    for (int j = pmb->js; j <= pmb->je + 1; ++j) {
+      for (int i = pmb->is; i <= pmb->ie; ++i) {
+        b.x2f(k, j, i) = (a1(k + 1, j, i) - a1(k, j, i)) / pcoord->dx3f(k) -
+                         (a3(k, j, i + 1) - a3(k, j, i)) / pcoord->dx1f(i);
+      }
+    }
+  }
+
+  for (int k = pmb->ks; k <= pmb->ke + 1; ++k) {
+    for (int j = pmb->js; j <= pmb->je; ++j) {
+      for (int i = pmb->is; i <= pmb->ie; ++i) {
+        b.x3f(k, j, i) = (a2(k, j, i + 1) - a2(k, j, i)) / pcoord->dx1f(i) -
+                         (a1(k, j + 1, i) - a1(k, j, i)) / pcoord->dx2f(j);
+      }
+    }
+  }
+}
+
+void InitializeForceFreeField(MeshBlock *pmb) {
+#if MAGNETIC_FIELDS_ENABLED
+  LoadForceFreeParameters();
+  if (UsingCartesianCoordinates()) {
+    InitializeForceFreeFieldCartesian(pmb);
+  } else {
+    InitializeForceFreeFieldSpherical(pmb);
+  }
 #else
   (void)pmb;
 #endif
@@ -1461,8 +1734,8 @@ Real NoiseSphericalBessel(int l, Real x) {
   for (int ell = 1; ell < l; ++ell) {
     const Real jp1 = ((2.0 * ell + 1.0) / x) * jcurr - jm1;
     if (!std::isfinite(jp1) || std::abs(jp1) > 1.0e12) {
-      std::cout << "### Warning in precipitator.cpp: spherical Bessel recurrence overflow "
-                << "(l=" << l << ", ell=" << ell << ", x=" << x
+      std::cout << "### Warning in precipitator.cpp: spherical Bessel recurrence "
+                << "overflow (l=" << l << ", ell=" << ell << ", x=" << x
                 << ", jm1=" << jm1 << ", jcurr=" << jcurr << ", jp1=" << jp1
                 << ")\n";
     }
@@ -1526,8 +1799,8 @@ void InitializePerturbationTables(const Mesh &mesh) {
   if (!PerturbationsActive()) {
     return;
   }
-  g_pert_radius_min = mesh.mesh_size.x1min;
-  g_pert_radius_max = mesh.mesh_size.x1max;
+  g_pert_radius_min = RadialProfileMinCode(mesh.mesh_size);
+  g_pert_radius_max = RadialProfileMaxCode(mesh.mesh_size);
   if (g_pert_ready) {
     return;
   }
@@ -1597,29 +1870,16 @@ void ApplyDensityPerturbations(MeshBlock *pmb) {
   for (int k = pmb->ks; k <= pmb->ke; ++k) {
     for (int j = pmb->js; j <= pmb->je; ++j) {
       for (int i = pmb->is; i <= pmb->ie; ++i) {
-        const Real r = coord->x1v(i);
-        if (InOuterBufferHalo(r)) {
+        const SphericalPoint sph = CellCenterSpherical(coord, k, j, i);
+        if (InOuterBufferHalo(sph.r)) {
           continue;
         }
-        Real theta = 0.0;
-        if (pmb->block_size.nx2 > 1) {
-          theta = coord->x2v(j);
-        } else {
-          theta = 0.5 * (coord->x2f(j) + coord->x2f(j + 1));
-        }
-        Real phi = 0.0;
-        if (pmb->block_size.nx3 > 1) {
-          phi = coord->x3v(k);
-        } else {
-          phi = 0.5 * (coord->x3f(k) + coord->x3f(k + 1));
-        }
-
-        const Real delta = g_pert_sigma * EvalSphHarmNoise(r, theta, phi);
+        const Real delta = g_pert_sigma * EvalSphHarmNoise(sph.r, sph.theta, sph.phi);
         if (!std::isfinite(delta) ||
             std::abs(delta) > kPerturbationWarningThreshold) {
           std::cout << "### Warning in precipitator.cpp: large density perturbation "
-                    << "delta=" << delta << " at (r=" << r
-                    << ", theta=" << theta << ", phi=" << phi << ")\n";
+                    << "delta=" << delta << " at (r=" << sph.r
+                    << ", theta=" << sph.theta << ", phi=" << sph.phi << ")\n";
         }
 
         const Real rho0 = prim(IDN, k, j, i);
@@ -1627,8 +1887,8 @@ void ApplyDensityPerturbations(MeshBlock *pmb) {
         if (rho_new <= 0.0) {
           std::cout << "### Warning in precipitator.cpp: density perturbation produced "
                     << "rho <= 0 (rho0=" << rho0 << ", delta=" << delta
-                    << ", r=" << r << ", theta=" << theta
-                    << ", phi=" << phi << ")\n";
+                    << ", r=" << sph.r << ", theta=" << sph.theta
+                    << ", phi=" << sph.phi << ")\n";
         }
         prim(IDN, k, j, i) = rho_new;
       }
@@ -1637,16 +1897,7 @@ void ApplyDensityPerturbations(MeshBlock *pmb) {
 }
 
 Real CellCenterRadiusCode(const Coordinates *coord, int k, int j, int i) {
-#if defined(COORDINATE_SYSTEM)
-  if (std::strcmp(COORDINATE_SYSTEM, "cartesian") == 0) {
-    const Real x = coord->x1v(i);
-    const Real y = coord->x2v(j);
-    const Real z = coord->x3v(k);
-    return std::sqrt(SQR(x) + SQR(y) + SQR(z));
-  }
-#endif
-  (void)k;
-  return coord->x1v(i);
+  return CellCenterSpherical(coord, k, j, i).r;
 }
 
 //----------------------------------------------------------------------------------------
@@ -1666,8 +1917,10 @@ Real PrecipitatorThetaGrid(Real x2, RegionSize rs) {
 
 // Forward declaration so we can enroll it before the definition appears.
 void PrecipitatorGravity(MeshBlock *pmb, const Real time, const Real dt,
-                         const AthenaArray<Real> &prim, const AthenaArray<Real> &prim_scalar,
-                         const AthenaArray<Real> &bcc, AthenaArray<Real> &cons,
+                         const AthenaArray<Real> &prim,
+                         const AthenaArray<Real> &prim_scalar,
+                         const AthenaArray<Real> &bcc,
+                         AthenaArray<Real> &cons,
                          AthenaArray<Real> &cons_scalar);
 
 //========================================================================================
@@ -1680,11 +1933,12 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
   Units *units = punit;
 
   const Real x2rat = pin->GetOrAddReal("mesh", "x2rat", 1.0);
-  if (x2rat < 0.0) {
+  if (x2rat < 0.0 && UsingSphericalPolarCoordinates()) {
     EnrollUserMeshGenerator(X2DIR, PrecipitatorThetaGrid);
   }
 
-  const std::string profile_filename = pin->GetString("precipitator", "hse_profile_filename");
+  const std::string profile_filename =
+      pin->GetString("precipitator", "hse_profile_filename");
   g_profile = std::unique_ptr<PrecipitatorProfile>(
       new PrecipitatorProfile(profile_filename));
 
@@ -1693,14 +1947,19 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
     g_uniform_height = pin->GetReal("precipitator", "uniform_init_height");
   }
 
+  const Real nominal_outer_radius = NominalOuterRadiusCode(mesh_size);
+  const Real radial_profile_min = RadialProfileMinCode(mesh_size);
+  const Real radial_profile_max = RadialProfileMaxCode(mesh_size);
+
   g_force_free_param_file =
       pin->GetOrAddString("precipitator", "force_free_param_file",
                           "inputs/force_free_params.txt");
 #if defined(COORDINATE_SYSTEM)
-  if (std::strcmp(COORDINATE_SYSTEM, "spherical_polar") != 0) {
+  if (!(UsingSphericalPolarCoordinates() || UsingCartesianCoordinates())) {
     std::stringstream msg;
     msg << "### FATAL ERROR in precipitator.cpp" << std::endl
-        << "Force-free magnetic configuration requires spherical_polar coordinates.";
+        << "Force-free magnetic configuration requires spherical_polar or cartesian "
+        << "coordinates.";
     ATHENA_ERROR(msg);
   }
 #endif
@@ -1710,7 +1969,8 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
     if (units == nullptr) {
       std::stringstream msg;
       msg << "### FATAL ERROR in precipitator.cpp" << std::endl
-          << "Units object must be configured before force_free_bfield_gauss can be used.";
+          << "Units object must be configured before force_free_bfield_gauss "
+          << "can be used.";
       ATHENA_ERROR(msg);
     }
     const Real code_bfield_cgs = units->code_magneticfield_cgs;
@@ -1737,19 +1997,21 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
       pin->GetOrAddString("precipitator", "enable_heating", "none");
   g_enable_magic_heating = (heating_mode == "magic");
   g_inner_sponge_radius =
-      pin->GetOrAddReal("precipitator", "inner_sponge_radius", mesh_size.x1min);
+      pin->GetOrAddReal("precipitator", "inner_sponge_radius", radial_profile_min);
   g_inner_sponge_tau =
       std::max(static_cast<Real>(0.0),
                pin->GetOrAddReal("precipitator", "inner_sponge_tau", 0.0));
   g_outer_sponge_inner_radius =
-      pin->GetOrAddReal("precipitator", "outer_sponge_inner_radius", mesh_size.x1max);
+      pin->GetOrAddReal("precipitator", "outer_sponge_inner_radius",
+                        nominal_outer_radius);
   g_outer_sponge_tau =
       std::max(static_cast<Real>(0.0),
                pin->GetOrAddReal("precipitator", "outer_sponge_tau", 0.0));
   g_enable_outer_buffer_halo =
       (pin->GetOrAddInteger("precipitator", "enable_outer_buffer_halo", 0) != 0);
   g_outer_buffer_inner_radius_code =
-      pin->GetOrAddReal("precipitator", "outer_buffer_inner_radius", mesh_size.x1max);
+      pin->GetOrAddReal("precipitator", "outer_buffer_inner_radius",
+                        nominal_outer_radius);
   g_outer_buffer_entropy_slope =
       pin->GetOrAddReal("precipitator", "outer_buffer_entropy_slope", 0.0);
   if (g_enable_outer_buffer_halo) {
@@ -1858,12 +2120,12 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
     }
     g_magic_mmw_code = g_magic_mmw_cgs * units->gram_code;
     g_magic_c_v = (units->k_boltzmann_code / g_magic_mmw_code) / g_gm1;
-    g_magic_profile_bins = mesh_size.nx1;
+    g_magic_profile_bins = RadialProfileBinCount(mesh_size);
     g_magic_error_profile.assign(static_cast<std::size_t>(g_magic_profile_bins), 0.0);
     g_magic_profile_ready = false;
     g_magic_profile_time = std::numeric_limits<Real>::quiet_NaN();
     g_magic_profile_dt = std::numeric_limits<Real>::quiet_NaN();
-    g_magic_profile_x1min = mesh_size.x1min;
+    g_magic_profile_x1min = radial_profile_min;
     g_magic_profile_inv_dr = 0.0;
   } else {
     g_magic_error_profile.clear();
@@ -1873,8 +2135,8 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
     g_magic_profile_dt = std::numeric_limits<Real>::quiet_NaN();
   }
 
-  g_pert_radius_min = mesh_size.x1min;
-  g_pert_radius_max = mesh_size.x1max;
+  g_pert_radius_min = radial_profile_min;
+  g_pert_radius_max = radial_profile_max;
   const int pert_flag =
       pin->GetOrAddInteger("precipitator", "enable_fourier_bessel_perturbations", 0);
   g_pert_sigma = pin->GetOrAddReal("precipitator", "perturbation_sigma", 0.01);
@@ -1963,11 +2225,7 @@ void MeshBlock::ProblemGenerator(ParameterInput *pin) {
   const int ku = ke;
 
   const bool use_cell_center_background =
-      g_enable_outer_buffer_halo
-#if defined(COORDINATE_SYSTEM)
-      || (std::strcmp(COORDINATE_SYSTEM, "cartesian") == 0)
-#endif
-      ;
+      g_enable_outer_buffer_halo || UsingCartesianCoordinates();
   const int nx1 = iu - il + 1;
   std::vector<Real> rho_profile(nx1);
 #if NON_BAROTROPIC_EOS
@@ -2067,7 +2325,8 @@ void MeshBlock::ProblemGenerator(ParameterInput *pin) {
 
 #if MAGNETIC_FIELDS_ENABLED
   InitializeForceFreeField(this);
-  pfield->CalculateCellCenteredField(pfield->b, pfield->bcc, pcoord, is, ie, js, je, ks, ke);
+  pfield->CalculateCellCenteredField(pfield->b, pfield->bcc, pcoord, is, ie, js,
+                                     je, ks, ke);
 
   for (int k = ks; k <= ke; ++k) {
     for (int j = js; j <= je; ++j) {
@@ -2102,7 +2361,8 @@ void MeshBlock::ProblemGenerator(ParameterInput *pin) {
 #endif
 
 #if MAGNETIC_FIELDS_ENABLED
-  peos->PrimitiveToConserved(phydro->w, pfield->bcc, phydro->u, pcoord, is, ie, js, je, ks, ke);
+  peos->PrimitiveToConserved(phydro->w, pfield->bcc, phydro->u, pcoord, is, ie,
+                             js, je, ks, ke);
 #else
   AthenaArray<Real> bb;
   bb.NewAthenaArray(3, ke + 1, je + 1, ie + 1);
@@ -2242,13 +2502,7 @@ void MeshBlock::UserWorkBeforeOutput(ParameterInput *pin) {
 #endif
 
   const std::vector<Real> &rho_bar = GetRadiallyAveragedDensity(mesh);
-  const bool has_profile =
-      (mesh != nullptr) && (mesh->mesh_size.nx1 > 0)
-      && (rho_bar.size() == static_cast<std::size_t>(mesh->mesh_size.nx1));
-  std::int64_t base_index = 0;
-  if (has_profile) {
-    base_index = ComputeGlobalX1Offset(*this, mesh->mesh_size.nx1);
-  }
+  const bool has_profile = !rho_bar.empty();
 
 #if NON_BAROTROPIC_EOS
   const std::vector<Real> &pressure_bar = GetRadiallyAveragedPressure(mesh);
@@ -2275,7 +2529,7 @@ void MeshBlock::UserWorkBeforeOutput(ParameterInput *pin) {
         const Real v1 = prim(IVX, k, j, i);
         const Real v2 = prim(IVY, k, j, i);
         const Real v3 = prim(IVZ, k, j, i);
-        const Real radius_code = pcoord->x1v(i);
+        const Real radius_code = CellCenterRadiusCode(pcoord, k, j, i);
         Real rho_avg = 0.0;
         Real v1_avg = 0.0;
         Real v2_avg = 0.0;
@@ -2287,23 +2541,15 @@ void MeshBlock::UserWorkBeforeOutput(ParameterInput *pin) {
 #endif
         bool have_bg = false;
         if (has_profile) {
-          const std::int64_t global_i = base_index + static_cast<std::int64_t>(i - is);
-          const std::size_t bg_idx = static_cast<std::size_t>(global_i);
-          if (bg_idx < rho_bar.size()) {
-            rho_avg = rho_bar[bg_idx];
-            have_bg = true;
-          }
-          if (bg_idx < v1_bar.size()) {
-            v1_avg = v1_bar[bg_idx];
-            v2_avg = v2_bar[bg_idx];
-            v3_avg = v3_bar[bg_idx];
-          }
+          rho_avg = SampleRadialProfile(rho_bar, radius_code);
+          v1_avg = SampleRadialProfile(v1_bar, radius_code);
+          v2_avg = SampleRadialProfile(v2_bar, radius_code);
+          v3_avg = SampleRadialProfile(v3_bar, radius_code);
+          have_bg = true;
 #if NON_BAROTROPIC_EOS
-          if (bg_idx < pressure_bar.size()) {
-            pressure_avg = pressure_bar[bg_idx];
-            entropy_avg = entropy_bar[bg_idx];
-            temperature_avg = temperature_bar[bg_idx];
-          }
+          pressure_avg = SampleRadialProfile(pressure_bar, radius_code);
+          entropy_avg = SampleRadialProfile(entropy_bar, radius_code);
+          temperature_avg = SampleRadialProfile(temperature_bar, radius_code);
 #endif
         }
 
@@ -2469,13 +2715,14 @@ void MeshBlock::UserWorkBeforeOutput(ParameterInput *pin) {
 //========================================================================================
 void Mesh::UserWorkInLoop() {
   if (g_profile && g_inner_sponge_tau > 0.0
-      && g_inner_sponge_radius > mesh_size.x1min) {
+      && !UsingCartesianCoordinates()
+      && g_inner_sponge_radius > RadialProfileMinCode(mesh_size)) {
     for (int block = 0; block < nblocal; ++block) {
       ApplyInnerSponge(my_blocks(block));
     }
   }
   if (g_profile && g_outer_sponge_tau > 0.0
-      && g_outer_sponge_inner_radius < mesh_size.x1max) {
+      && g_outer_sponge_inner_radius < NominalOuterRadiusCode(mesh_size)) {
     for (int block = 0; block < nblocal; ++block) {
       ApplyOuterSponge(my_blocks(block));
     }
@@ -2534,14 +2781,18 @@ void Mesh::UserWorkInLoop() {
 //! \brief Gravity source term using tabulated potential differences
 //========================================================================================
 void PrecipitatorGravity(MeshBlock *pmb, const Real time, const Real dt,
-                         const AthenaArray<Real> &prim, const AthenaArray<Real> &prim_scalar,
-                         const AthenaArray<Real> &bcc, AthenaArray<Real> &cons,
+                         const AthenaArray<Real> &prim,
+                         const AthenaArray<Real> &prim_scalar,
+                         const AthenaArray<Real> &bcc,
+                         AthenaArray<Real> &cons,
                          AthenaArray<Real> &cons_scalar) {
-  const bool gravity_enabled = (g_uniform_init == 0) && static_cast<bool>(g_profile);
-  const bool cooling_enabled = g_enable_powerlaw_cooling && (g_powerlaw_lambda_code > 0.0);
-  const bool heating_enabled = g_enable_magic_heating && (g_powerlaw_lambda_code > 0.0) &&
-                               (g_magic_profile_bins > 0) && (g_magic_c_v > 0.0) &&
-                               (g_magic_Kp != 0.0);
+  const bool gravity_enabled =
+      (g_uniform_init == 0) && static_cast<bool>(g_profile);
+  const bool cooling_enabled =
+      g_enable_powerlaw_cooling && (g_powerlaw_lambda_code > 0.0);
+  const bool heating_enabled =
+      g_enable_magic_heating && (g_powerlaw_lambda_code > 0.0) &&
+      (g_magic_profile_bins > 0) && (g_magic_c_v > 0.0) && (g_magic_Kp != 0.0);
   if (!gravity_enabled && !cooling_enabled && !heating_enabled) {
     return;
   }
@@ -2557,7 +2808,7 @@ void PrecipitatorGravity(MeshBlock *pmb, const Real time, const Real dt,
     }
   }
   Coordinates *pcoord = pmb->pcoord;
-  const Real outer_radius_code = pmb->pmy_mesh->mesh_size.x1max;
+  const Real outer_radius_code = NominalOuterRadiusCode(pmb->pmy_mesh->mesh_size);
   if (heating_enabled) {
     UpdateMagicHeatingProfile(pmb->pmy_mesh, time, dt);
   }
@@ -2583,23 +2834,37 @@ void PrecipitatorGravity(MeshBlock *pmb, const Real time, const Real dt,
 #endif
         const Real pressure = thermal_eint * g_gm1;
 
-        if (gravity_enabled && pressure > 0.0) {
-          const Real dx1 = pcoord->dx1v(i);
-          const Real phi_center = PotentialInCodeUnits(pcoord->x1v(i), units);
-          const Real phi_minus = PotentialInCodeUnits(pcoord->x1f(i), units);
-          const Real phi_plus = PotentialInCodeUnits(pcoord->x1f(i + 1), units);
+        if (gravity_enabled) {
+          if (UsingCartesianCoordinates()) {
+            const SphericalPoint sph = CellCenterSpherical(pcoord, k, j, i);
+            if (rho > 0.0 && sph.r > 0.0) {
+              const Real gmag = GravityInCodeUnits(sph.r, units);
+              const Real gx = -gmag * sph.rhat_x;
+              const Real gy = -gmag * sph.rhat_y;
+              const Real gz = -gmag * sph.rhat_z;
+              cons(IM1, k, j, i) += dt * rho * gx;
+              cons(IM2, k, j, i) += dt * rho * gy;
+              cons(IM3, k, j, i) += dt * rho * gz;
+              cons(IEN, k, j, i) += dt * (mom1 * gx + mom2 * gy + mom3 * gz);
+            }
+          } else if (pressure > 0.0) {
+            const Real dx1 = pcoord->dx1v(i);
+            const Real phi_center = PotentialInCodeUnits(pcoord->x1v(i), units);
+            const Real phi_minus = PotentialInCodeUnits(pcoord->x1f(i), units);
+            const Real phi_plus = PotentialInCodeUnits(pcoord->x1f(i + 1), units);
 
-          const Real kT_over_mu = pressure * inv_rho;
-          if (kT_over_mu > 0.0) {
-            const Real p_hse_plus =
-                pressure * std::exp(-(phi_plus - phi_center) / kT_over_mu);
-            const Real p_hse_minus =
-                pressure * std::exp(-(phi_minus - phi_center) / kT_over_mu);
+            const Real kT_over_mu = pressure * inv_rho;
+            if (kT_over_mu > 0.0) {
+              const Real p_hse_plus =
+                  pressure * std::exp(-(phi_plus - phi_center) / kT_over_mu);
+              const Real p_hse_minus =
+                  pressure * std::exp(-(phi_minus - phi_center) / kT_over_mu);
 
-            cons(IM1, k, j, i) += dt * (p_hse_plus - p_hse_minus) / dx1;
+              cons(IM1, k, j, i) += dt * (p_hse_plus - p_hse_minus) / dx1;
 
-            const Real vr = mom1 * inv_rho;
-            cons(IEN, k, j, i) -= dt * rho * vr * (phi_plus - phi_minus) / dx1;
+              const Real vr = mom1 * inv_rho;
+              cons(IEN, k, j, i) -= dt * rho * vr * (phi_plus - phi_minus) / dx1;
+            }
           }
         }
 
