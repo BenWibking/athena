@@ -14,7 +14,8 @@ athena_read.check_nan_flag = True
 
 
 def prepare(**kwargs):
-    athena.configure('b', prob='precipitator', coord='cartesian', **kwargs)
+    athena.configure('b', 'hdf5', prob='precipitator', coord='cartesian',
+                     **kwargs)
     athena.make()
 
 
@@ -39,8 +40,7 @@ def run(**kwargs):
 
 
 def analyze():
-    _, _, _, data = athena_read.vtk(
-        'bin/precipitator_cartesian_smoke.block0.prim.00001.vtk')
+    data = athena_read.athdf('bin/precipitator_cartesian_smoke.prim.00001.athdf')
 
     for values in data.values():
         if not np.all(np.isfinite(values)):

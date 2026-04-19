@@ -1,6 +1,6 @@
 <comment>
 problem   = Idealized galaxy precipitator (Athena++, Cartesian)
-configure = --prob=precipitator --coord=cartesian -b
+configure = --prob=precipitator --coord=cartesian -b -hdf5
 
 <job>
 problem_id = precipitator_cartesian
@@ -10,7 +10,8 @@ file_type  = hst
 dcycle     = 1000
 
 <output2>
-file_type  = vtk
+file_type  = hdf5
+data_format = float32
 variable   = prim,divB,grav_phi,pressure_hse,temperature_K,entropy_K,delta_rho_over_rho_bar
 dt         = 100
 id         = prim
