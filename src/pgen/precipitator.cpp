@@ -294,8 +294,24 @@ CartesianPoint Edge3Position(const Coordinates *coord, int k, int j, int i) {
                                     CellCenteredCoord3(coord, k));
 }
 
+Real CartesianRadius(const CartesianPoint &pos) {
+  return std::sqrt(SQR(pos.x) + SQR(pos.y) + SQR(pos.z));
+}
+
+Real Face1RadiusCode(const Coordinates *coord, int k, int j, int i) {
+  return CartesianRadius(Face1CenterPosition(coord, k, j, i));
+}
+
+Real Face2RadiusCode(const Coordinates *coord, int k, int j, int i) {
+  return CartesianRadius(Face2CenterPosition(coord, k, j, i));
+}
+
+Real Face3RadiusCode(const Coordinates *coord, int k, int j, int i) {
+  return CartesianRadius(Face3CenterPosition(coord, k, j, i));
+}
+
 SphericalPoint CartesianToSpherical(const CartesianPoint &pos) {
-  const Real r = std::sqrt(SQR(pos.x) + SQR(pos.y) + SQR(pos.z));
+  const Real r = CartesianRadius(pos);
   if (!(r > 0.0)) {
     return {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
   }
@@ -2836,16 +2852,54 @@ void PrecipitatorGravity(MeshBlock *pmb, const Real time, const Real dt,
 
         if (gravity_enabled) {
           if (UsingCartesianCoordinates()) {
-            const SphericalPoint sph = CellCenterSpherical(pcoord, k, j, i);
-            if (rho > 0.0 && sph.r > 0.0) {
-              const Real gmag = GravityInCodeUnits(sph.r, units);
-              const Real gx = -gmag * sph.rhat_x;
-              const Real gy = -gmag * sph.rhat_y;
-              const Real gz = -gmag * sph.rhat_z;
-              cons(IM1, k, j, i) += dt * rho * gx;
-              cons(IM2, k, j, i) += dt * rho * gy;
-              cons(IM3, k, j, i) += dt * rho * gz;
-              cons(IEN, k, j, i) += dt * (mom1 * gx + mom2 * gy + mom3 * gz);
+            if (pressure > 0.0) {
+              const Real kT_over_mu = pressure * inv_rho;
+              if (kT_over_mu > 0.0) {
+                const Real phi_center = PotentialInCodeUnits(radius_code, units);
+                auto hydrostatic_face_pressure = [&](Real phi_face) {
+                  return pressure * std::exp(-(phi_face - phi_center) / kT_over_mu);
+                };
+
+                const Real dx1 = pcoord->dx1v(i);
+                const Real phi1_minus =
+                    PotentialInCodeUnits(Face1RadiusCode(pcoord, k, j, i), units);
+                const Real phi1_plus =
+                    PotentialInCodeUnits(Face1RadiusCode(pcoord, k, j, i + 1), units);
+                const Real p_hse1_minus = hydrostatic_face_pressure(phi1_minus);
+                const Real p_hse1_plus = hydrostatic_face_pressure(phi1_plus);
+                cons(IM1, k, j, i) += dt * (p_hse1_plus - p_hse1_minus) / dx1;
+
+                const Real vx = mom1 * inv_rho;
+                cons(IEN, k, j, i) -= dt * rho * vx * (phi1_plus - phi1_minus) / dx1;
+
+                if (pmb->block_size.nx2 > 1) {
+                  const Real dx2 = pcoord->dx2v(j);
+                  const Real phi2_minus =
+                      PotentialInCodeUnits(Face2RadiusCode(pcoord, k, j, i), units);
+                  const Real phi2_plus =
+                      PotentialInCodeUnits(Face2RadiusCode(pcoord, k, j + 1, i), units);
+                  const Real p_hse2_minus = hydrostatic_face_pressure(phi2_minus);
+                  const Real p_hse2_plus = hydrostatic_face_pressure(phi2_plus);
+                  cons(IM2, k, j, i) += dt * (p_hse2_plus - p_hse2_minus) / dx2;
+
+                  const Real vy = mom2 * inv_rho;
+                  cons(IEN, k, j, i) -= dt * rho * vy * (phi2_plus - phi2_minus) / dx2;
+                }
+
+                if (pmb->block_size.nx3 > 1) {
+                  const Real dx3 = pcoord->dx3v(k);
+                  const Real phi3_minus =
+                      PotentialInCodeUnits(Face3RadiusCode(pcoord, k, j, i), units);
+                  const Real phi3_plus =
+                      PotentialInCodeUnits(Face3RadiusCode(pcoord, k + 1, j, i), units);
+                  const Real p_hse3_minus = hydrostatic_face_pressure(phi3_minus);
+                  const Real p_hse3_plus = hydrostatic_face_pressure(phi3_plus);
+                  cons(IM3, k, j, i) += dt * (p_hse3_plus - p_hse3_minus) / dx3;
+
+                  const Real vz = mom3 * inv_rho;
+                  cons(IEN, k, j, i) -= dt * rho * vz * (phi3_plus - phi3_minus) / dx3;
+                }
+              }
             }
           } else if (pressure > 0.0) {
             const Real dx1 = pcoord->dx1v(i);
