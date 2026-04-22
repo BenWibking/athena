@@ -35,25 +35,37 @@ ncycle_out = 1
 nx1    = 64
 x1min  = -120.0
 x1max  = 120.0
-ix1_bc = outflow
-ox1_bc = outflow
+ix1_bc = periodic
+ox1_bc = periodic
 
 nx2    = 64
 x2min  = -120.0
 x2max  = 120.0
-ix2_bc = outflow
-ox2_bc = outflow
+ix2_bc = periodic
+ox2_bc = periodic
 
 nx3    = 64
 x3min  = -120.0
 x3max  = 120.0
-ix3_bc = outflow
-ox3_bc = outflow
+ix3_bc = periodic
+ox3_bc = periodic
+
+refinement = static
 
 <meshblock>
 nx1 = 16
 nx2 = 16
 nx3 = 16
+
+<refinement1>
+# Refine the central 2x2x2 root blocks by one level.
+x1min = -60.0
+x1max =  60.0
+x2min = -60.0
+x2max =  60.0
+x3min = -60.0
+x3max =  60.0
+level = 1
 
 <hydro>
 gamma = 1.6666666666666667
