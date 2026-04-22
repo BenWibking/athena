@@ -409,12 +409,6 @@ void ComputeRadialProfiles(Mesh *mesh) {
   if (mesh == nullptr) {
     return;
   }
-  if (mesh->multilevel) {
-    std::stringstream msg;
-    msg << "### FATAL ERROR in precipitator.cpp" << std::endl
-        << "Density contrast output is not implemented for multilevel meshes.";
-    ATHENA_ERROR(msg);
-  }
 
   const int num_bins = RadialProfileBinCount(mesh->mesh_size);
   if (num_bins <= 0) {
@@ -467,6 +461,8 @@ void ComputeRadialProfiles(Mesh *mesh) {
     if (pmb == nullptr || pmb->phydro == nullptr) {
       continue;
     }
+    // Mesh::my_blocks stores the active leaf blocks, so volume-weighted sums over
+    // local blocks remain valid on multilevel meshes.
     Coordinates *coord = pmb->pcoord;
     auto &prim = pmb->phydro->w;
 
@@ -976,9 +972,6 @@ void ApplyOuterSponge(MeshBlock *pmb) {
   }
   Mesh *mesh = pmb->pmy_mesh;
   if (mesh == nullptr) {
-    return;
-  }
-  if (mesh->multilevel) {
     return;
   }
   const Real dt = mesh->dt;
