@@ -13,14 +13,14 @@ dcycle     = 1000
 file_type  = hdf5
 data_format = float32
 variable   = prim,divB,grav_phi,pressure_hse,temperature_K,entropy_K,delta_rho_over_rho_bar
-dt         = 100
+dt         = 25
 id         = prim
 
 <output3>
 file_type   = rst
 ghost_zones = true
 id          = restart
-dcycle      = 10000
+dcycle      = 1000
 
 <time>
 cfl_number = 0.25
@@ -95,7 +95,7 @@ outer_buffer_entropy_slope = 0.0
 enable_powerlaw_cooling = 1
 powerlaw_lambda_cgs = 1e-22
 
-enable_fourier_bessel_perturbations = 0
+enable_fourier_bessel_perturbations = 1
 perturbation_sigma = 0.01
 perturbation_lmax = 12
 perturbation_radial_modes = 16
@@ -105,5 +105,5 @@ perturbation_seed = 88172645463393265
 
 enable_heating = magic
 thermostat_temperature = 1.0e7
-thermostat_Kp = 10.0
+thermostat_Kp = 5.0
 h_smooth_heatcool = 20.0
